@@ -6,6 +6,7 @@ Pipeline: Gemini extracts → Python calculates → Gemini verbalizes.
 All math is done in Python (insights.py). Gemini NEVER does math.
 """
 
+import asyncio
 import logging
 
 from telegram import Update
@@ -17,7 +18,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
-from telegram.constants import ParseMode
+from telegram.constants import ChatAction, ParseMode
 
 import config
 import sheets_handler as sheets
@@ -127,16 +128,18 @@ async def get_weight(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         f"📏 BMI: {bmi} ({insights.bmi_category(bmi)})\n"
         f"🎯 יעדי מאקרו יומיים:\n"
         f"   חלבון: {macros['protein_g']}g | פחמימות: {macros['carbs_g']}g | שומן: {macros['fats_g']}g\n\n"
-        "פקודות:\n"
-        "/log\\_food — רישום ארוחה (טקסט או תמונה)\n"
-        "/log\\_water — רישום שתייה\n"
-        "/log\\_workout — רישום אימון\n"
-        "/log\\_scale — מדידת משקל (טקסט או תמונה)\n"
-        "/log\\_cycle — מחזור\n"
-        "/upload\\_blood — בדיקת דם (טקסט או תמונה)\n"
-        "/log\\_wearable — שינה וצעדים\n"
+        "פקודות מהירות:\n"
+        "/food — רישום ארוחה\n"
+        "/water — שתייה\n"
+        "/workout — אימון\n"
+        "/scale — מדידת משקל\n"
+        "/cycle — מחזור\n"
+        "/blood — בדיקת דם\n"
+        "/sleep — שינה וצעדים\n"
         "/status — סטטוס יומי\n"
-        "/review — סיכום שבועי AI",
+        "/review — סיכום שבועי AI\n\n"
+        "💡 /help לרשימת פקודות מלאה\n"
+        "💬 או פשוט כתוב/י הודעה ואענה לפי הנתונים שלך!",
     )
     return ConversationHandler.END
 
@@ -144,6 +147,43 @@ async def get_weight(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("❌ בוטל.")
     return ConversationHandler.END
+
+
+# ============================================================================
+# /help — Command reference
+# ============================================================================
+
+HELP_TEXT = (
+    "📋 *פקודות BiteAndByte*\n\n"
+    "🍽️ *תזונה*\n"
+    "/food — רישום ארוחה (טקסט או תמונה)\n"
+    "/fix — תיקון רישום אחרון (calories/protein/carbs/fats)\n"
+    "/correct — שמירת פריט ל-Cache לזיהוי עתידי\n\n"
+    "💧 *שתייה*\n"
+    "/water <ליטרים> — רישום שתייה\n\n"
+    "🏋️ *אימון*\n"
+    "/workout <סוג> <דקות> <עצימות 1-10>\n"
+    "   סוגים: functional, strength, cardio\n\n"
+    "⚖️ *מדידות*\n"
+    "/scale <משקל> <שומן%> <מים%> <עצם> <שריר>\n"
+    "/blood — הזנת בדיקת דם (שלב אחר שלב)\n\n"
+    "😴 *שינה וצעדים*\n"
+    "/sleep <צעדים> <שעות שינה> <good/fair/poor>\n\n"
+    "🔄 *מחזור*\n"
+    "/cycle <שלב> [הערות]\n"
+    "   שלבים: follicular, ovulation, luteal, menstrual\n\n"
+    "📊 *דוחות*\n"
+    "/status — סטטוס יומי\n"
+    "/review — סיכום שבועי AI\n\n"
+    "📸 *תמונות*\n"
+    "שלח/י תמונה עם כיתוב: אוכל / דם / משקל\n\n"
+    "💬 *שיחה חופשית*\n"
+    "שלח/י כל הודעה ואקבל תשובה מבוססת על הנתונים שלך"
+)
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _safe_reply(update.message, HELP_TEXT)
 
 
 # ============================================================================
@@ -783,6 +823,39 @@ async def correct_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 # Free-text handler — Context Injection (catch-all, must be registered LAST)
 # ============================================================================
 
+async def _edit_safe(msg, text: str) -> None:
+    """Edit a message with Markdown, falling back to plain text."""
+    try:
+        await msg.edit_text(text, parse_mode=ParseMode.MARKDOWN)
+    except Exception:
+        plain = text.replace("*", "").replace("_", "")
+        try:
+            await msg.edit_text(plain)
+        except Exception:
+            pass
+
+
+async def _typing_loop(chat_id, bot) -> None:
+    """Send 'typing...' action every 4s until cancelled."""
+    try:
+        while True:
+            await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+            await asyncio.sleep(4)
+    except asyncio.CancelledError:
+        pass
+
+
+async def _slow_warning(ack_msg, delay: float = 10.0) -> None:
+    """Edit ACK message with a 'still working' notice after *delay* seconds."""
+    try:
+        await asyncio.sleep(delay)
+        await ack_msg.edit_text(
+            "⏳ המערכת עמוסה מעט, אבל אני עדיין מעבד את התשובה עבורך..."
+        )
+    except asyncio.CancelledError:
+        pass
+
+
 async def free_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle any non-command text by answering with full 14-day context."""
     user_id = update.effective_user.id
@@ -793,15 +866,31 @@ async def free_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text("⚠️ לא נמצא פרופיל. הפעל/י /start כדי להתחיל.")
         return
 
-    user_context = insights.build_user_context(user_id)
+    # 1. Immediate ACK
+    ack_msg = await update.message.reply_text(
+        "🔎 אני עובר על הנתונים שלך בטבלה ומנתח את המצב, רק רגע..."
+    )
+
+    # 2. Typing indicator + slow-response warning (run in background)
+    typing_task = asyncio.create_task(
+        _typing_loop(update.effective_chat.id, context.bot)
+    )
+    warning_task = asyncio.create_task(_slow_warning(ack_msg))
+
     try:
+        user_context = insights.build_user_context(user_id)
         answer = gemini_client.answer_with_context(question, user_context)
     except Exception:
         logger.exception("Context answering failed")
-        await update.message.reply_text("⚠️ לא הצלחתי לעבד את ההודעה. נסה/י שוב.")
+        typing_task.cancel()
+        warning_task.cancel()
+        await ack_msg.edit_text("⚠️ לא הצלחתי לעבד את ההודעה. נסה/י שוב.")
         return
 
-    await _safe_reply(update.message, answer)
+    # 3. Cancel background tasks and edit ACK with the real answer
+    typing_task.cancel()
+    warning_task.cancel()
+    await _edit_safe(ack_msg, answer)
 
 
 # ============================================================================
@@ -833,7 +922,10 @@ def main() -> None:
     )
 
     blood_conv = ConversationHandler(
-        entry_points=[CommandHandler("upload_blood", upload_blood_command)],
+        entry_points=[
+            CommandHandler("upload_blood", upload_blood_command),
+            CommandHandler("blood", upload_blood_command),
+        ],
         states={
             BLOOD_INPUT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, blood_input_handler),
@@ -843,7 +935,10 @@ def main() -> None:
     )
 
     food_conv = ConversationHandler(
-        entry_points=[CommandHandler("log_food", log_food_command)],
+        entry_points=[
+            CommandHandler("log_food", log_food_command),
+            CommandHandler("food", log_food_command),
+        ],
         states={
             FOOD_INPUT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, food_input_handler),
@@ -856,13 +951,19 @@ def main() -> None:
     app.add_handler(blood_conv)
     app.add_handler(food_conv)
 
-    # --- Simple command handlers ---
+    # --- Simple command handlers (with short aliases) ---
 
+    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("log_water", log_water_command))
+    app.add_handler(CommandHandler("water", log_water_command))
     app.add_handler(CommandHandler("log_workout", log_workout_command))
+    app.add_handler(CommandHandler("workout", log_workout_command))
     app.add_handler(CommandHandler("log_scale", log_scale_command))
+    app.add_handler(CommandHandler("scale", log_scale_command))
     app.add_handler(CommandHandler("log_cycle", log_cycle_command))
+    app.add_handler(CommandHandler("cycle", log_cycle_command))
     app.add_handler(CommandHandler("log_wearable", log_wearable_command))
+    app.add_handler(CommandHandler("sleep", log_wearable_command))
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("review", review_command))
     app.add_handler(CommandHandler("correct", correct_command))

@@ -8,11 +8,7 @@
 4. Click **Create API Key** → select or create a Google Cloud project
 5. Copy the API key — this is your `GEMINI_API_KEY`
 
-**Free tier includes:**
-- Gemini 1.5 Flash: 15 RPM, 1M TPM, 1500 RPD
-- Gemini 1.5 Pro: 2 RPM, 32K TPM, 50 RPD
-
-The bot uses Flash for daily logging (fast, free) and Pro only for weekly reviews and blood test analysis.
+The bot uses Gemini 2.5 Flash for daily logging (fast) and Gemini 2.5 Pro only for weekly reviews and blood test analysis.
 
 ## 2. Google Cloud & Sheets Setup
 
@@ -46,8 +42,8 @@ The bot uses Flash for daily logging (fast, free) and Pro only for weekly review
    (found in `credentials.json` → `client_email` field) — give **Editor** access
 
 The bot will auto-create all worksheet tabs on first use:
-- User_Profile, Biometric_Data, Food_Log, Hydration_Log
-- Exercise_Log, Cycle_Tracking, Blood_Work, Wearable_Sync
+- User_Profiles, Biometrics, Food_Log, Hydration
+- Workouts, Cycle_Data, Blood_Work, Wearable_Sync, Food_Cache
 
 ## 3. Telegram Bot Setup
 
@@ -59,15 +55,18 @@ The bot will auto-create all worksheet tabs on first use:
 Send to BotFather after selecting your bot with `/setcommands`:
 ```
 start - הגדרת פרופיל
-log_food - רישום ארוחה (טקסט או תמונה)
-log_water - רישום שתייה
-log_workout - רישום אימון
-log_scale - רישום מדידת משקל
-log_cycle - רישום מחזור
-upload_blood - הזנת בדיקת דם
-log_wearable - רישום שינה וצעדים
+food - רישום ארוחה (טקסט או תמונה)
+water - רישום שתייה
+workout - רישום אימון
+scale - רישום מדידת משקל
+cycle - רישום מחזור
+blood - הזנת בדיקת דם
+sleep - רישום שינה וצעדים
 status - סטטוס יומי
 review - סיכום שבועי AI
+fix - תיקון רישום אוכל אחרון
+correct - שמירת פריט לזיהוי עתידי
+help - רשימת פקודות
 cancel - ביטול פעולה
 ```
 
@@ -91,45 +90,52 @@ cp .env.example .env
 #   GEMINI_API_KEY=...
 
 # Run the bot
-python bot.py
+python main.py
 ```
 
 ## 5. Commands Reference
 
-| Command | Description | Example |
-|---------|-------------|---------|
-| `/start` | Profile setup (guided) | `/start` |
-| `/log_food` | Log food (text, Gemini analyzes) | `/log_food חזה עוף עם אורז` |
-| Photo | Send food/blood/scale photo | Photo + caption "אוכל" |
-| `/log_water` | Log water intake | `/log_water 0.5` |
-| `/log_workout` | Log exercise | `/log_workout functional 45 7` |
-| `/log_scale` | Log body composition | `/log_scale 75.2 18.5 55.3 3.1 35.8` |
-| `/log_cycle` | Log cycle phase | `/log_cycle luteal` |
-| `/upload_blood` | Enter blood markers (guided) | `/upload_blood` |
-| `/log_wearable` | Log steps & sleep | `/log_wearable 8500 7.5 good` |
-| `/status` | Daily snapshot | `/status` |
-| `/review` | Weekly AI review (Gemini Pro) | `/review` |
+| Short | Full | Description | Example |
+|-------|------|-------------|---------|
+| `/start` | | Profile setup (guided) | `/start` |
+| `/food` | `/log_food` | Log food (text or photo) | `/food חזה עוף עם אורז` |
+| `/water` | `/log_water` | Log water intake | `/water 0.5` |
+| `/workout` | `/log_workout` | Log exercise | `/workout functional 45 7` |
+| `/scale` | `/log_scale` | Log body composition | `/scale 75.2 18.5 55.3 3.1 35.8` |
+| `/cycle` | `/log_cycle` | Log cycle phase | `/cycle luteal` |
+| `/blood` | `/upload_blood` | Enter blood markers (guided) | `/blood` |
+| `/sleep` | `/log_wearable` | Log steps & sleep | `/sleep 8500 7.5 good` |
+| `/status` | | Daily snapshot | `/status` |
+| `/review` | | Weekly AI review (Gemini Pro) | `/review` |
+| `/fix` | | Fix last food entry | `/fix protein 25` |
+| `/correct` | | Save item to Food Cache | `/correct מולר 200 160 25 12 2` |
+| `/help` | | Show all commands | `/help` |
 
 ### Photo Detection
 Send a photo with one of these captions:
-- **"אוכל"** or **"food"** → Food analysis (Gemini Vision)
-- **"דם"** or **"blood"** → Blood test extraction (Gemini Pro Vision)
-- **"משקל"** or **"scale"** → Scale screenshot extraction
-- No caption → defaults to food analysis
+- **"אוכל"** or **"food"** — Food analysis (Gemini Vision)
+- **"דם"** or **"blood"** — Blood test extraction (Gemini Pro Vision)
+- **"משקל"** or **"scale"** — Scale screenshot extraction
+- No caption — defaults to food analysis
+
+### Free-text Chat
+Send any message without a command and the bot will answer based on your last 14 days of data (food, sleep, cycle, workouts, weight, blood work).
 
 ## 6. Architecture
 
 ```
-bot.py              → Entry point, handler wiring
+main.py             → Entry point, all Telegram handlers & bot wiring
 config.py           → Environment vars, constants
-sheets.py           → Google Sheets CRUD (8 worksheets)
-gemini_client.py    → Gemini Flash/Pro API (text + vision)
-insights.py         → Local BMR/TDEE math + Gemini-powered reviews
-handlers.py         → Telegram command & photo handlers
+sheets_handler.py   → Google Sheets CRUD (9 worksheets)
+gemini_client.py    → Gemini 2.5 Flash/Pro API (text + vision)
+insights.py         → Local BMR/TDEE math, context builder
+nutrition_db.py     → Local food nutrition database (100+ foods)
 ```
+
+**Pipeline:** Gemini extracts → Python calculates → Gemini verbalizes. All math is done in Python.
 
 **Cost optimization strategy:**
 - BMR, TDEE, calorie burn, hydration goals → calculated locally in Python
 - Food cache → checks Google Sheets before calling Gemini
-- Daily logging → Gemini 1.5 Flash (free tier, fast)
-- Weekly reviews & blood analysis → Gemini 1.5 Pro (complex, 50 RPD free)
+- Daily logging → Gemini 2.5 Flash (fast)
+- Weekly reviews & blood analysis → Gemini 2.5 Pro (complex)
