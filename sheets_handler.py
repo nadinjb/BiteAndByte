@@ -1,11 +1,18 @@
-"""Google Sheets data layer for BiteAndByte health bot."""
+"""Google Sheets data layer for BiteAndByte health bot.
 
+Includes TTL caching (60s) and retry with backoff for 429 rate limits.
+"""
+
+import logging
+import time
 from datetime import datetime, timedelta
 
 import gspread
 from google.oauth2.service_account import Credentials
 
 import config
+
+logger = logging.getLogger(__name__)
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -39,6 +46,57 @@ def _get_or_create_worksheet(
         ws = sheet.add_worksheet(title=name, rows=1000, cols=len(headers))
         ws.append_row(headers, value_input_option="RAW")
     return ws
+
+
+# ---------------------------------------------------------------------------
+# Retry with exponential backoff for 429 rate limits
+# ---------------------------------------------------------------------------
+
+def _retry(func, *args, max_retries: int = 3, **kwargs):
+    """Call *func* with retry + exponential backoff on 429 / quota errors."""
+    for attempt in range(max_retries):
+        try:
+            return func(*args, **kwargs)
+        except gspread.exceptions.APIError as e:
+            status = e.response.status_code if hasattr(e, "response") else 0
+            if status == 429 and attempt < max_retries - 1:
+                wait = 2 ** attempt * 5  # 5s, 10s, 20s
+                logger.warning("Sheets 429 rate limit, retrying in %ds...", wait)
+                time.sleep(wait)
+                continue
+            raise
+    return None  # unreachable, but keeps type checkers happy
+
+
+# ---------------------------------------------------------------------------
+# TTL Cache — avoids repeated get_all_records() calls within 60s
+# ---------------------------------------------------------------------------
+
+_cache: dict[str, tuple[float, list[dict]]] = {}
+_CACHE_TTL = 60  # seconds
+
+
+def _get_records_cached(ws_fn, ws_name: str) -> list[dict]:
+    """Return cached get_all_records() for a worksheet, refreshing every 60s."""
+    now = time.time()
+    if ws_name in _cache:
+        ts, records = _cache[ws_name]
+        if now - ts < _CACHE_TTL:
+            return records
+    ws = ws_fn()
+    records = _retry(ws.get_all_records)
+    _cache[ws_name] = (now, records)
+    return records
+
+
+def _invalidate_cache(ws_name: str) -> None:
+    """Clear cache for a worksheet after a write operation."""
+    _cache.pop(ws_name, None)
+
+
+def invalidate_all_caches() -> None:
+    """Clear all cached records (useful after batch operations)."""
+    _cache.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -127,9 +185,9 @@ def today() -> str:
     return datetime.now().strftime("%Y-%m-%d")
 
 
-def _records_for_user(ws_fn, user_id: int, days: int) -> list[dict]:
-    ws = ws_fn()
-    records = ws.get_all_records()
+def _records_for_user(ws_fn, ws_name: str, user_id: int, days: int) -> list[dict]:
+    """Get recent records for a user from cache."""
+    records = _get_records_cached(ws_fn, ws_name)
     cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
     return [
         r for r in records
@@ -142,8 +200,7 @@ def _records_for_user(ws_fn, user_id: int, days: int) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def get_profile(user_id: int) -> dict | None:
-    ws = profiles_ws()
-    records = ws.get_all_records()
+    records = _get_records_cached(profiles_ws, config.WS_PROFILES)
     for r in records:
         if str(r.get("user_id")) == str(user_id):
             return r
@@ -155,18 +212,16 @@ def save_profile(
     height_cm: float, initial_weight_kg: float,
 ) -> None:
     ws = profiles_ws()
-    records = ws.get_all_records()
+    records = _retry(ws.get_all_records)
+    row_data = [str(user_id), name, age, gender, height_cm, initial_weight_kg]
     for idx, r in enumerate(records):
         if str(r.get("user_id")) == str(user_id):
             row_num = idx + 2
-            ws.update(f"A{row_num}:F{row_num}", [[
-                str(user_id), name, age, gender, height_cm, initial_weight_kg,
-            ]])
+            _retry(ws.update, f"A{row_num}:F{row_num}", [row_data])
+            _invalidate_cache(config.WS_PROFILES)
             return
-    ws.append_row(
-        [str(user_id), name, age, gender, height_cm, initial_weight_kg],
-        value_input_option="RAW",
-    )
+    _retry(ws.append_row, row_data, value_input_option="RAW")
+    _invalidate_cache(config.WS_PROFILES)
 
 
 # ---------------------------------------------------------------------------
@@ -178,14 +233,16 @@ def log_biometrics(
     water: float, bone_mass: float, muscle_mass: float,
 ) -> None:
     ws = biometrics_ws()
-    ws.append_row(
+    _retry(
+        ws.append_row,
         [str(user_id), today(), weight, body_fat, water, bone_mass, muscle_mass],
         value_input_option="RAW",
     )
+    _invalidate_cache(config.WS_BIOMETRICS)
 
 
 def get_biometrics(user_id: int, days: int = 7) -> list[dict]:
-    return _records_for_user(biometrics_ws, user_id, days)
+    return _records_for_user(biometrics_ws, config.WS_BIOMETRICS, user_id, days)
 
 
 # ---------------------------------------------------------------------------
@@ -197,14 +254,16 @@ def log_food(
     protein: float, carbs: float, fats: float,
 ) -> None:
     ws = food_ws()
-    ws.append_row(
+    _retry(
+        ws.append_row,
         [str(user_id), today(), item, calories, protein, carbs, fats],
         value_input_option="RAW",
     )
+    _invalidate_cache(config.WS_FOOD)
 
 
 def get_food(user_id: int, days: int = 7) -> list[dict]:
-    return _records_for_user(food_ws, user_id, days)
+    return _records_for_user(food_ws, config.WS_FOOD, user_id, days)
 
 
 # Column indices in Food_Log: A=user_id, B=date, C=item, D=calories, E=protein, F=carbs, G=fats
@@ -220,7 +279,7 @@ def fix_last_food_entry(user_id: int, field: str, value: float) -> dict | None:
     if col is None:
         return None
     ws = food_ws()
-    records = ws.get_all_records()
+    records = _retry(ws.get_all_records)
     # Find last row for this user
     last_idx = None
     for idx, r in enumerate(records):
@@ -229,20 +288,16 @@ def fix_last_food_entry(user_id: int, field: str, value: float) -> dict | None:
     if last_idx is None:
         return None
     row_num = last_idx + 2  # +1 header, +1 zero-index
-    ws.update_cell(row_num, col, value)
+    _retry(ws.update_cell, row_num, col, value)
+    _invalidate_cache(config.WS_FOOD)
     # Return updated record
     records[last_idx][field + ("_g" if field != "calories" else "")] = value
     return records[last_idx]
 
 
 def find_cached_food(user_id: int, search_term: str) -> list[dict]:
-    """Search previous food entries for a matching item (local cache).
-
-    Returns matching entries so Gemini can use them as reference instead of
-    re-analyzing from scratch — saves API tokens.
-    """
-    ws = food_ws()
-    records = ws.get_all_records()
+    """Search previous food entries for a matching item (local cache)."""
+    records = _get_records_cached(food_ws, config.WS_FOOD)
     term = search_term.lower()
     return [
         r for r in records
@@ -257,21 +312,20 @@ def find_cached_food(user_id: int, search_term: str) -> list[dict]:
 
 def log_hydration(user_id: int, liters: float) -> None:
     ws = hydration_ws()
-    records = ws.get_all_records()
+    records = _get_records_cached(hydration_ws, config.WS_HYDRATION)
     for idx, r in enumerate(records):
         if str(r.get("user_id")) == str(user_id) and r.get("date") == today():
             row_num = idx + 2
             new_total = float(r.get("liters", 0)) + liters
-            ws.update_cell(row_num, 3, new_total)
+            _retry(ws.update_cell, row_num, 3, new_total)
+            _invalidate_cache(config.WS_HYDRATION)
             return
-    ws.append_row(
-        [str(user_id), today(), liters],
-        value_input_option="RAW",
-    )
+    _retry(ws.append_row, [str(user_id), today(), liters], value_input_option="RAW")
+    _invalidate_cache(config.WS_HYDRATION)
 
 
 def get_hydration(user_id: int, days: int = 7) -> list[dict]:
-    return _records_for_user(hydration_ws, user_id, days)
+    return _records_for_user(hydration_ws, config.WS_HYDRATION, user_id, days)
 
 
 # ---------------------------------------------------------------------------
@@ -283,14 +337,16 @@ def log_exercise(
     intensity: int, estimated_kcal: float,
 ) -> None:
     ws = exercise_ws()
-    ws.append_row(
+    _retry(
+        ws.append_row,
         [str(user_id), today(), exercise_type, duration_min, intensity, estimated_kcal],
         value_input_option="RAW",
     )
+    _invalidate_cache(config.WS_EXERCISE)
 
 
 def get_exercise(user_id: int, days: int = 7) -> list[dict]:
-    return _records_for_user(exercise_ws, user_id, days)
+    return _records_for_user(exercise_ws, config.WS_EXERCISE, user_id, days)
 
 
 # ---------------------------------------------------------------------------
@@ -299,14 +355,16 @@ def get_exercise(user_id: int, days: int = 7) -> list[dict]:
 
 def log_cycle(user_id: int, phase: str, notes: str = "") -> None:
     ws = cycle_ws()
-    ws.append_row(
+    _retry(
+        ws.append_row,
         [str(user_id), today(), phase, notes],
         value_input_option="RAW",
     )
+    _invalidate_cache(config.WS_CYCLE)
 
 
 def get_cycle(user_id: int, days: int = 30) -> list[dict]:
-    return _records_for_user(cycle_ws, user_id, days)
+    return _records_for_user(cycle_ws, config.WS_CYCLE, user_id, days)
 
 
 def get_current_phase(user_id: int) -> str | None:
@@ -329,12 +387,12 @@ def log_blood_work(user_id: int, markers: dict) -> None:
         "crp", "notes",
     ]:
         row.append(markers.get(col, ""))
-    ws.append_row(row, value_input_option="RAW")
+    _retry(ws.append_row, row, value_input_option="RAW")
+    _invalidate_cache(config.WS_BLOOD)
 
 
 def get_blood_work(user_id: int) -> list[dict]:
-    ws = blood_ws()
-    records = ws.get_all_records()
+    records = _get_records_cached(blood_ws, config.WS_BLOOD)
     return [
         r for r in records
         if str(r.get("user_id")) == str(user_id)
@@ -349,14 +407,16 @@ def log_wearable(
     user_id: int, steps: int, sleep_hours: float, sleep_quality: str,
 ) -> None:
     ws = wearable_ws()
-    ws.append_row(
+    _retry(
+        ws.append_row,
         [str(user_id), today(), steps, sleep_hours, sleep_quality],
         value_input_option="RAW",
     )
+    _invalidate_cache(config.WS_WEARABLE)
 
 
 def get_wearable(user_id: int, days: int = 7) -> list[dict]:
-    return _records_for_user(wearable_ws, user_id, days)
+    return _records_for_user(wearable_ws, config.WS_WEARABLE, user_id, days)
 
 
 def get_latest_wearable(user_id: int) -> dict | None:
@@ -374,25 +434,22 @@ def save_food_cache(
 ) -> None:
     """Save or update a cached food item for a user."""
     ws = food_cache_ws()
-    records = ws.get_all_records()
+    records = _retry(ws.get_all_records)
     term = item.strip().lower()
+    row_data = [str(user_id), item, grams, calories, protein, carbs, fats]
     for idx, r in enumerate(records):
         if str(r.get("user_id")) == str(user_id) and str(r.get("item", "")).lower() == term:
             row_num = idx + 2
-            ws.update(f"A{row_num}:G{row_num}", [[
-                str(user_id), item, grams, calories, protein, carbs, fats,
-            ]])
+            _retry(ws.update, f"A{row_num}:G{row_num}", [row_data])
+            _invalidate_cache("Food_Cache")
             return
-    ws.append_row(
-        [str(user_id), item, grams, calories, protein, carbs, fats],
-        value_input_option="RAW",
-    )
+    _retry(ws.append_row, row_data, value_input_option="RAW")
+    _invalidate_cache("Food_Cache")
 
 
 def lookup_food_cache(user_id: int, search_term: str) -> list[dict]:
     """Search Food_Cache for matching items. Returns best matches."""
-    ws = food_cache_ws()
-    records = ws.get_all_records()
+    records = _get_records_cached(food_cache_ws, "Food_Cache")
     term = search_term.strip().lower()
     return [
         r for r in records
@@ -400,3 +457,42 @@ def lookup_food_cache(user_id: int, search_term: str) -> list[dict]:
         and (term in str(r.get("item", "")).lower()
              or str(r.get("item", "")).lower() in term)
     ][:5]
+
+
+# ---------------------------------------------------------------------------
+# Bulk data fetch — single API call per worksheet for heavy operations
+# ---------------------------------------------------------------------------
+
+def get_all_user_data(user_id: int, days: int = 14) -> dict:
+    """Fetch all data for a user across all tabs in one pass.
+
+    Returns a dict with keys: profile, food, biometrics, hydration,
+    exercise, cycle, wearable, blood. Each is filtered for user_id
+    and date range (except profile and blood which return all).
+
+    This replaces 10+ individual API calls with cached reads.
+    """
+    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    uid = str(user_id)
+
+    def _user_recent(ws_fn, ws_name):
+        return [
+            r for r in _get_records_cached(ws_fn, ws_name)
+            if str(r.get("user_id")) == uid and r.get("date", "") >= cutoff
+        ]
+
+    profile = get_profile(user_id)
+
+    return {
+        "profile": profile,
+        "food": _user_recent(food_ws, config.WS_FOOD),
+        "biometrics": _user_recent(biometrics_ws, config.WS_BIOMETRICS),
+        "hydration": _user_recent(hydration_ws, config.WS_HYDRATION),
+        "exercise": _user_recent(exercise_ws, config.WS_EXERCISE),
+        "cycle": _user_recent(cycle_ws, config.WS_CYCLE),
+        "wearable": _user_recent(wearable_ws, config.WS_WEARABLE),
+        "blood": [
+            r for r in _get_records_cached(blood_ws, config.WS_BLOOD)
+            if str(r.get("user_id")) == uid
+        ],
+    }

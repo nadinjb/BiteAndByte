@@ -7,6 +7,7 @@ hydration targets, blood range-checks, cycle adjustments, wearable scoring.
 """
 
 import json
+from datetime import datetime, timedelta
 
 import config
 import sheets_handler as sheets
@@ -526,16 +527,33 @@ def calculate_scale_data(
 
 
 def calculate_daily_status(user_id: int) -> dict:
-    """Pre-calculate complete daily status for Gemini feedback."""
-    profile = sheets.get_profile(user_id)
+    """Pre-calculate complete daily status for Gemini feedback.
+
+    Uses get_all_user_data() for a single cached pass over all tabs.
+    """
+    data = sheets.get_all_user_data(user_id, days=7)
+    profile = data["profile"]
     if not profile:
         return {}
 
-    bmr = get_bmr_for_user(user_id)
-    tdee = get_tdee_for_user(user_id)
+    # BMR / TDEE from profile + biometrics
+    weight = float(profile.get("initial_weight_kg", 70))
+    bio = data["biometrics"]
+    if bio:
+        weight = float(bio[-1].get("weight_kg", weight))
+    bmr = calculate_bmr(
+        weight,
+        float(profile.get("height_cm", 170)),
+        int(profile.get("age", 30)),
+        str(profile.get("gender", "male")),
+    )
+    exercises = data["exercise"]
+    today_ex = [e for e in exercises if e.get("date") == sheets.today()]
+    ex_kcal = sum(float(e.get("estimated_kcal", 0)) for e in today_ex)
+    tdee = calculate_tdee(bmr, ex_kcal)
 
     # Food
-    food = [f for f in sheets.get_food(user_id, days=1) if f.get("date") == sheets.today()]
+    food = [f for f in data["food"] if f.get("date") == sheets.today()]
     total_cal = sum(float(f.get("calories", 0)) for f in food)
     total_pro = sum(float(f.get("protein_g", 0)) for f in food)
     remaining_cal = round(max(0, tdee - total_cal))
@@ -546,38 +564,34 @@ def calculate_daily_status(user_id: int) -> dict:
     protein_status = f"{total_pro:.0f}g / {targets['protein_g']}g ({protein_pct}%)"
 
     # Hydration
-    h_goal = calculate_hydration_target(
-        exercise_entries=sheets.get_exercise(user_id, days=1)
-    )
+    h_goal = calculate_hydration_target(exercise_entries=today_ex)
     h_consumed = sum(
         float(r.get("liters", 0))
-        for r in sheets.get_hydration(user_id, days=1)
+        for r in data["hydration"] if r.get("date") == sheets.today()
     )
     h_pct = round(h_consumed / max(h_goal, 0.1) * 100)
 
     # Exercise
-    today_ex = [
-        e for e in sheets.get_exercise(user_id, days=1)
-        if e.get("date") == sheets.today()
-    ]
     if today_ex:
-        ex_kcal = sum(float(e.get("estimated_kcal", 0)) for e in today_ex)
         exercise_today = f"{len(today_ex)} אימונים ({ex_kcal:.0f} קק\"ל)"
     else:
         exercise_today = "לא"
 
     # Sleep
-    wearable = sheets.get_latest_wearable(user_id)
+    wearable = data["wearable"]
     sleep_note = "אין נתון"
     if wearable:
-        sleep_note = f"{wearable.get('sleep_hours', '?')} שעות ({wearable.get('sleep_quality', '?')})"
+        latest = wearable[-1]
+        sleep_note = f"{latest.get('sleep_hours', '?')} שעות ({latest.get('sleep_quality', '?')})"
 
     # Cycle
-    phase = sheets.get_current_phase(user_id)
+    cycle_entries = data["cycle"]
     cycle_note = "לא רלוונטי"
-    if phase:
-        adj = get_cycle_adjustments(phase)
-        cycle_note = f"{phase} — {adj['recommended_intensity']}"
+    if cycle_entries:
+        phase = cycle_entries[-1].get("phase")
+        if phase:
+            adj = get_cycle_adjustments(phase)
+            cycle_note = f"{phase} — {adj['recommended_intensity']}"
 
     return {
         "name": profile.get("name", ""),
@@ -595,16 +609,36 @@ def calculate_daily_status(user_id: int) -> dict:
 
 
 def calculate_weekly_review(user_id: int) -> dict:
-    """Pre-calculate ALL weekly review data for Gemini verbalization."""
-    profile = sheets.get_profile(user_id)
+    """Pre-calculate ALL weekly review data for Gemini verbalization.
+
+    Uses get_all_user_data() for a single cached pass over all tabs.
+    """
+    data = sheets.get_all_user_data(user_id, days=30)
+    profile = data["profile"]
     if not profile:
         return {}
 
-    bmr = get_bmr_for_user(user_id)
-    tdee = get_tdee_for_user(user_id)
+    # BMR / TDEE
+    weight = float(profile.get("initial_weight_kg", 70))
+    all_bio = data["biometrics"]
+    if all_bio:
+        weight = float(all_bio[-1].get("weight_kg", weight))
+    bmr = calculate_bmr(
+        weight,
+        float(profile.get("height_cm", 170)),
+        int(profile.get("age", 30)),
+        str(profile.get("gender", "male")),
+    )
+    exercises = data["exercise"]
+    ex_today_kcal = sum(
+        float(e.get("estimated_kcal", 0)) for e in exercises
+        if e.get("date") == sheets.today()
+    )
+    tdee = calculate_tdee(bmr, ex_today_kcal)
 
-    # Weight & composition
-    bio = sheets.get_biometrics(user_id, days=7)
+    # Weight & composition (last 7 days from the 30-day fetch)
+    cutoff_7d = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+    bio = [b for b in all_bio if b.get("date", "") >= cutoff_7d]
     weight_trend = {}
     if bio:
         latest = bio[-1]
@@ -626,10 +660,22 @@ def calculate_weekly_review(user_id: int) -> dict:
             float(profile.get("height_cm", 170)),
         )
 
-    composition = calculate_composition_deltas(user_id, days=30)
+    # Composition deltas from the 30-day biometrics already fetched
+    composition = {"has_data": False}
+    if len(all_bio) >= 2:
+        first_b, last_b = all_bio[0], all_bio[-1]
+        def _delta(key):
+            return round(float(last_b.get(key, 0)) - float(first_b.get(key, 0)), 2)
+        composition = {
+            "has_data": True,
+            "weight_delta": _delta("weight_kg"),
+            "fat_delta": _delta("body_fat_pct"),
+            "muscle_delta": _delta("muscle_mass_kg"),
+            "water_delta": _delta("water_pct"),
+        }
 
-    # Nutrition
-    food = sheets.get_food(user_id, days=7)
+    # Nutrition (last 7 days from the 30-day food fetch)
+    food = [f for f in data["food"] if f.get("date", "") >= cutoff_7d]
     days_logged = len({f.get("date") for f in food}) if food else 0
     total_cal = sum(float(f.get("calories", 0)) for f in food)
     total_pro = sum(float(f.get("protein_g", 0)) for f in food)
@@ -639,26 +685,25 @@ def calculate_weekly_review(user_id: int) -> dict:
 
     macro_targets = calculate_macro_targets(tdee)
 
-    # Hydration
-    hydration = sheets.get_hydration(user_id, days=7)
+    # Hydration (last 7 days)
+    hydration = [h for h in data["hydration"] if h.get("date", "") >= cutoff_7d]
     h_days = len(hydration) if hydration else 0
     h_total = sum(float(h.get("liters", 0)) for h in hydration)
     h_avg = round(h_total / max(h_days, 1), 1)
-    h_target = calculate_hydration_target(
-        exercise_entries=sheets.get_exercise(user_id, days=1)
-    )
+    today_ex = [e for e in exercises if e.get("date") == sheets.today()]
+    h_target = calculate_hydration_target(exercise_entries=today_ex)
 
-    # Exercise
-    exercises = sheets.get_exercise(user_id, days=7)
-    ex_total_kcal = sum(float(e.get("estimated_kcal", 0)) for e in exercises)
-    ex_total_min = sum(float(e.get("duration_min", 0)) for e in exercises)
+    # Exercise (last 7 days)
+    exercises_7d = [e for e in exercises if e.get("date", "") >= cutoff_7d]
+    ex_total_kcal = sum(float(e.get("estimated_kcal", 0)) for e in exercises_7d)
+    ex_total_min = sum(float(e.get("duration_min", 0)) for e in exercises_7d)
     ex_types = {}
-    for e in exercises:
+    for e in exercises_7d:
         t = e.get("type", "?")
         ex_types[t] = ex_types.get(t, 0) + 1
 
-    # Wearable
-    wearable = sheets.get_wearable(user_id, days=7)
+    # Wearable (last 7 days)
+    wearable = [w for w in data["wearable"] if w.get("date", "") >= cutoff_7d]
     sleep_summary = {}
     if wearable:
         avg_sleep = round(
@@ -671,13 +716,15 @@ def calculate_weekly_review(user_id: int) -> dict:
 
     # Cycle
     cycle_info = {}
-    phase = sheets.get_current_phase(user_id)
-    if phase:
-        adj = get_cycle_adjustments(phase)
-        cycle_info = {"phase": phase, **adj}
+    cycle_entries = data["cycle"]
+    if cycle_entries:
+        phase = cycle_entries[-1].get("phase")
+        if phase:
+            adj = get_cycle_adjustments(phase)
+            cycle_info = {"phase": phase, **adj}
 
     # Blood
-    blood = sheets.get_blood_work(user_id)
+    blood = data["blood"]
     blood_summary = {}
     if blood:
         blood_summary = check_blood_ranges(blood[-1])
@@ -708,7 +755,7 @@ def calculate_weekly_review(user_id: int) -> dict:
         "hydration_avg": h_avg,
         "hydration_target": h_target,
         "exercise_summary": {
-            "sessions": len(exercises),
+            "sessions": len(exercises_7d),
             "total_kcal": round(ex_total_kcal),
             "total_min": round(ex_total_min),
             "types": ex_types,
@@ -729,18 +776,35 @@ def build_user_context(user_id: int) -> str:
 
     This context is injected into Gemini for free-form questions, analysis,
     planning, education, and proactive insights.
+
+    Uses get_all_user_data() for a single cached pass over all tabs.
     """
-    profile = sheets.get_profile(user_id)
+    data = sheets.get_all_user_data(user_id, days=14)
+    profile = data["profile"]
     if not profile:
         return ""
 
     # --- Computed baselines ---
-    bmr = get_bmr_for_user(user_id)
-    tdee = get_tdee_for_user(user_id)
+    weight = float(profile.get("initial_weight_kg", 70))
+    bio_all = data["biometrics"]
+    if bio_all:
+        weight = float(bio_all[-1].get("weight_kg", weight))
+    bmr = calculate_bmr(
+        weight,
+        float(profile.get("height_cm", 170)),
+        int(profile.get("age", 30)),
+        str(profile.get("gender", "male")),
+    )
+    exercises = data["exercise"]
+    ex_today_kcal = sum(
+        float(e.get("estimated_kcal", 0)) for e in exercises
+        if e.get("date") == sheets.today()
+    )
+    tdee = calculate_tdee(bmr, ex_today_kcal)
     bmi_val = 0.0
 
     # --- Food (14 days) ---
-    food = sheets.get_food(user_id, days=14)
+    food = data["food"]
     today_food = [f for f in food if f.get("date") == sheets.today()]
     today_cal = sum(float(f.get("calories", 0)) for f in today_food)
     today_pro = sum(float(f.get("protein_g", 0)) for f in today_food)
@@ -756,7 +820,7 @@ def build_user_context(user_id: int) -> str:
     )
 
     # --- Biometrics / Weight (14 days) ---
-    bio = sheets.get_biometrics(user_id, days=14)
+    bio = data["biometrics"]
     weight_section = "אין מדידות אחרונות"
     if bio:
         latest = bio[-1]
@@ -771,17 +835,14 @@ def build_user_context(user_id: int) -> str:
             weight_section += f"\nשינוי ב-14 יום: {delta:+.1f} ק\"ג"
 
     # --- Hydration ---
-    hydration = sheets.get_hydration(user_id, days=14)
+    hydration = data["hydration"]
     today_water = sum(
         float(h.get("liters", 0)) for h in hydration if h.get("date") == sheets.today()
     )
-    h_target = calculate_hydration_target(
-        exercise_entries=sheets.get_exercise(user_id, days=1)
-    )
+    today_ex = [e for e in exercises if e.get("date") == sheets.today()]
+    h_target = calculate_hydration_target(exercise_entries=today_ex)
 
     # --- Exercise (14 days) ---
-    exercises = sheets.get_exercise(user_id, days=14)
-    today_ex = [e for e in exercises if e.get("date") == sheets.today()]
     today_ex_kcal = sum(float(e.get("estimated_kcal", 0)) for e in today_ex)
     ex_summary_lines = []
     for e in exercises[-7:]:
@@ -791,7 +852,7 @@ def build_user_context(user_id: int) -> str:
         )
 
     # --- Sleep / Wearable (14 days) ---
-    wearable = sheets.get_wearable(user_id, days=14)
+    wearable = data["wearable"]
     sleep_section = "אין נתוני שינה"
     if wearable:
         latest_w = wearable[-1]
@@ -807,20 +868,22 @@ def build_user_context(user_id: int) -> str:
         )
 
     # --- Cycle ---
-    phase = sheets.get_current_phase(user_id)
+    cycle_entries = data["cycle"]
     cycle_section = "לא רלוונטי"
-    if phase:
-        adj = get_cycle_adjustments(phase)
-        cycle_section = (
-            f"שלב נוכחי: {phase}\n"
-            f"התאמת קלוריות: {adj['calorie_adjustment']:+d} | "
-            f"עצימות מומלצת: {adj['recommended_intensity']}\n"
-            f"{adj['weight_fluctuation_note']}\n"
-            f"ברזל: {adj['iron_note']}"
-        )
+    if cycle_entries:
+        phase = cycle_entries[-1].get("phase")
+        if phase:
+            adj = get_cycle_adjustments(phase)
+            cycle_section = (
+                f"שלב נוכחי: {phase}\n"
+                f"התאמת קלוריות: {adj['calorie_adjustment']:+d} | "
+                f"עצימות מומלצת: {adj['recommended_intensity']}\n"
+                f"{adj['weight_fluctuation_note']}\n"
+                f"ברזל: {adj['iron_note']}"
+            )
 
     # --- Blood Work ---
-    blood = sheets.get_blood_work(user_id)
+    blood = data["blood"]
     blood_section = "אין בדיקות דם"
     if blood:
         latest_blood = blood[-1]
