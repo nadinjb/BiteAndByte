@@ -112,6 +112,13 @@ def wearable_ws() -> gspread.Worksheet:
     )
 
 
+def food_cache_ws() -> gspread.Worksheet:
+    return _get_or_create_worksheet(
+        "Food_Cache",
+        ["user_id", "item", "grams", "calories", "protein_g", "carbs_g", "fats_g"],
+    )
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -198,6 +205,34 @@ def log_food(
 
 def get_food(user_id: int, days: int = 7) -> list[dict]:
     return _records_for_user(food_ws, user_id, days)
+
+
+# Column indices in Food_Log: A=user_id, B=date, C=item, D=calories, E=protein, F=carbs, G=fats
+_FOOD_COL = {"calories": 4, "protein": 5, "carbs": 6, "fats": 7}
+
+
+def fix_last_food_entry(user_id: int, field: str, value: float) -> dict | None:
+    """Update a single field in the user's most recent Food_Log row.
+
+    Returns the updated row as a dict, or None if no entry found.
+    """
+    col = _FOOD_COL.get(field)
+    if col is None:
+        return None
+    ws = food_ws()
+    records = ws.get_all_records()
+    # Find last row for this user
+    last_idx = None
+    for idx, r in enumerate(records):
+        if str(r.get("user_id")) == str(user_id):
+            last_idx = idx
+    if last_idx is None:
+        return None
+    row_num = last_idx + 2  # +1 header, +1 zero-index
+    ws.update_cell(row_num, col, value)
+    # Return updated record
+    records[last_idx][field + ("_g" if field != "calories" else "")] = value
+    return records[last_idx]
 
 
 def find_cached_food(user_id: int, search_term: str) -> list[dict]:
@@ -327,3 +362,41 @@ def get_wearable(user_id: int, days: int = 7) -> list[dict]:
 def get_latest_wearable(user_id: int) -> dict | None:
     entries = get_wearable(user_id, days=2)
     return entries[-1] if entries else None
+
+
+# ---------------------------------------------------------------------------
+# Food Cache — learned corrections (Rule #3)
+# ---------------------------------------------------------------------------
+
+def save_food_cache(
+    user_id: int, item: str, grams: float,
+    calories: float, protein: float, carbs: float, fats: float,
+) -> None:
+    """Save or update a cached food item for a user."""
+    ws = food_cache_ws()
+    records = ws.get_all_records()
+    term = item.strip().lower()
+    for idx, r in enumerate(records):
+        if str(r.get("user_id")) == str(user_id) and str(r.get("item", "")).lower() == term:
+            row_num = idx + 2
+            ws.update(f"A{row_num}:G{row_num}", [[
+                str(user_id), item, grams, calories, protein, carbs, fats,
+            ]])
+            return
+    ws.append_row(
+        [str(user_id), item, grams, calories, protein, carbs, fats],
+        value_input_option="RAW",
+    )
+
+
+def lookup_food_cache(user_id: int, search_term: str) -> list[dict]:
+    """Search Food_Cache for matching items. Returns best matches."""
+    ws = food_cache_ws()
+    records = ws.get_all_records()
+    term = search_term.strip().lower()
+    return [
+        r for r in records
+        if str(r.get("user_id")) == str(user_id)
+        and (term in str(r.get("item", "")).lower()
+             or str(r.get("item", "")).lower() in term)
+    ][:5]

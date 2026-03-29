@@ -130,23 +130,42 @@ def _parse_json(text: str, fallback: dict) -> dict:
 # STEP 1 — EXTRACTION (Gemini identifies what, not how much nutritionally)
 # ============================================================================
 
-def extract_food_from_text(description: str) -> list[dict]:
+def extract_food_from_text(description: str, cached_items: list[dict] | None = None) -> list[dict]:
     """Extract food items and estimated grams from a text description.
 
-    Returns list of: {"item": "חזה עוף", "grams": 200}
-    Gemini only identifies items and portions — ZERO calorie math.
+    Returns list of: {"item": "...", "grams": 200, "calories": null, "protein_g": null, ...}
+    If the user explicitly stated a nutritional value, it MUST appear in the output.
     """
-    prompt = f"""זהה את כל פריטי המזון ואת המשקל המשוער בגרמים מהתיאור הבא.
-אם לא צוין משקל, הערך מנה ממוצעת בגרמים.
+    cache_ctx = ""
+    if cached_items:
+        cache_lines = "\n".join(
+            f"- {c['item']}: {c['calories']} קק\"ל, {c['protein_g']}g חלבון, "
+            f"{c['carbs_g']}g פחמימות, {c['fats_g']}g שומן (ל-{c['grams']}g)"
+            for c in cached_items
+        )
+        cache_ctx = f"""
+פריטים שמורים של המשתמש (עדיפות עליונה — השתמש בערכים האלה!):
+{cache_lines}
+"""
 
+    prompt = f"""זהה את כל פריטי המזון ואת המשקל המשוער בגרמים מהתיאור הבא.
+
+כללים קריטיים:
+1. עדיפות לנתונים מפורשים: אם המשתמש ציין מספר ספציפי (למשל "25g חלבון", "300 קלוריות", "15g שומן"), חלץ את המספר המדויק. אל תעריך — השתמש במה שנכתב.
+2. מודעות למותגים: אם מוזכר שם מותג (Muller, PRO, Go, דנונה, יוטבתה), העדף את הגרסה עתירת החלבון / High Protein של המוצר.
+3. אם לא צוין משקל, הערך מנה ממוצעת בגרמים.
+{cache_ctx}
 תיאור: "{description}"
 
 החזר JSON בלבד (בלי markdown):
-[{{"item": "שם הפריט בעברית", "grams": 0}}, ...]
+[{{"item": "שם הפריט", "grams": 0, "calories": null, "protein_g": null, "carbs_g": null, "fats_g": null}}, ...]
 
-דוגמאות למנות ממוצעות:
-- חזה עוף: 150g, ביצה: 55g, כוס אורז מבושל: 200g
-- פיתה: 80g, סלט: 150g, שניצל: 180g"""
+מלא ערכי תזונה רק אם המשתמש ציין אותם במפורש. השאר null למה שלא צוין.
+
+דוגמאות:
+- "מולר 25g חלבון" → {{"item": "מולר פרו", "grams": 200, "protein_g": 25}}
+- "חזה עוף 200 גרם" → {{"item": "חזה עוף", "grams": 200}}
+- "שייק 300 קלוריות 30g חלבון" → {{"item": "שייק חלבון", "grams": 400, "calories": 300, "protein_g": 30}}"""
 
     text = _ask_flash(prompt)
     result = _parse_json(text, fallback={"_list": []})
@@ -393,3 +412,26 @@ def generate_status_feedback(calculated: dict) -> str:
 תן טיפ יומי קצר (2-3 משפטים) בעברית — מה כדאי לעשות עד סוף היום.
 אל תציג מספרים שונים מאלה שניתנו לך."""
     return _ask_flash_system(prompt)
+
+
+# ---------------------------------------------------------------------------
+# Context-aware free-text answering
+# ---------------------------------------------------------------------------
+
+def answer_with_context(question: str, user_context: str) -> str:
+    """Answer a free-text question using 14-day user data as context."""
+    prompt = f"""אתה יועץ תזונה ובריאות מקצועי וחכם. ענה תמיד בעברית.
+להלן כל הנתונים של המשתמש/ת מ-14 הימים האחרונים:
+{user_context}
+---
+הוראות:
+- ענה על השאלה/הודעה של המשתמש/ת בהתבסס על הנתונים למעלה.
+- אם שואל "למה אני עייפ/ה?" — בדוק שינה, ברזל, פחמימות, מחזור
+- אם מבקש תכנון ארוחה — חשב לפי קלוריות/חלבון שנותרו
+- אם שואל על בדיקות דם — הסבר בשפה פשוטה
+- אם אומר "בוקר טוב" — תדרוך בוקר (שינה, מחזור, יעדים, אימון, שתייה)
+- השתמש רק במספרים מהנתונים. אל תמציא.
+- 4-8 משפטים, עברית, אימוג'ים.
+הודעת המשתמש/ת: "{question}"
+"""
+    return _call_with_retry(config.GEMINI_FLASH, prompt, system=_SYSTEM_HEB)

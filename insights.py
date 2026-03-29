@@ -6,6 +6,8 @@ This module owns every formula: BMR, TDEE, BMI, calorie burn, macro targets,
 hydration targets, blood range-checks, cycle adjustments, wearable scoring.
 """
 
+import json
+
 import config
 import sheets_handler as sheets
 import nutrition_db
@@ -336,13 +338,16 @@ def calculate_composition_deltas(user_id: int, days: int = 30) -> dict:
 # STEP 2 — CALCULATE (takes Gemini-extracted raw data, returns computed dict)
 # ============================================================================
 
-def calculate_food_nutrition(extracted_items: list[dict]) -> dict:
+def calculate_food_nutrition(extracted_items: list[dict], user_id: int = 0) -> dict:
     """Calculate total nutrition from Gemini-extracted food items.
 
-    Each item: {"item": "חזה עוף", "grams": 200}
+    Each item: {"item": "...", "grams": 200, "calories": null, "protein_g": null, ...}
 
-    Step 1: Try local nutrition_db
-    Step 2: If not found, Gemini already gave grams — use generic estimate
+    Priority order:
+      1. Explicit values from user (non-null fields in extraction)
+      2. Food_Cache (learned corrections per user)
+      3. Local nutrition_db
+      4. Generic estimate fallback
 
     Returns: {items: [...], total_calories, total_protein, total_carbs, total_fats}
     """
@@ -356,34 +361,68 @@ def calculate_food_nutrition(extracted_items: list[dict]) -> dict:
         food_name = entry.get("item", "")
         grams = float(entry.get("grams", 150))
 
-        # Try local database first
-        db_result = nutrition_db.calculate_nutrition(food_name, grams)
+        # Check for explicit values from user (Rule #1)
+        explicit_cal = entry.get("calories")
+        explicit_pro = entry.get("protein_g")
+        explicit_carbs = entry.get("carbs_g")
+        explicit_fats = entry.get("fats_g")
+        has_explicit = any(v is not None for v in [explicit_cal, explicit_pro, explicit_carbs, explicit_fats])
 
-        if db_result:
-            items.append(db_result)
-            total_cal += db_result["calories"]
-            total_pro += db_result["protein_g"]
-            total_carbs += db_result["carbs_g"]
-            total_fats += db_result["fats_g"]
-        else:
-            # Fallback: generic estimate (1.2 kcal/g average mixed food)
-            est_cal = round(grams * 1.2, 1)
-            est_pro = round(grams * 0.08, 1)
-            est_carbs = round(grams * 0.15, 1)
-            est_fats = round(grams * 0.05, 1)
-            items.append({
+        item_result = None
+
+        if has_explicit:
+            # User provided explicit values — use them, fill gaps from DB
+            db_result = nutrition_db.calculate_nutrition(food_name, grams)
+            item_result = {
                 "item": food_name,
                 "grams": grams,
-                "calories": est_cal,
-                "protein_g": est_pro,
-                "carbs_g": est_carbs,
-                "fats_g": est_fats,
+                "calories": float(explicit_cal) if explicit_cal is not None else (db_result["calories"] if db_result else round(grams * 1.2, 1)),
+                "protein_g": float(explicit_pro) if explicit_pro is not None else (db_result["protein_g"] if db_result else round(grams * 0.08, 1)),
+                "carbs_g": float(explicit_carbs) if explicit_carbs is not None else (db_result["carbs_g"] if db_result else round(grams * 0.15, 1)),
+                "fats_g": float(explicit_fats) if explicit_fats is not None else (db_result["fats_g"] if db_result else round(grams * 0.05, 1)),
                 "from_db": False,
-            })
-            total_cal += est_cal
-            total_pro += est_pro
-            total_carbs += est_carbs
-            total_fats += est_fats
+                "explicit": True,
+            }
+
+        if not item_result and user_id:
+            # Check Food_Cache (Rule #3 — learned corrections)
+            cached = sheets.lookup_food_cache(user_id, food_name)
+            if cached:
+                c = cached[0]
+                factor = grams / max(float(c.get("grams", 100)), 1)
+                item_result = {
+                    "item": food_name,
+                    "grams": grams,
+                    "calories": round(float(c.get("calories", 0)) * factor, 1),
+                    "protein_g": round(float(c.get("protein_g", 0)) * factor, 1),
+                    "carbs_g": round(float(c.get("carbs_g", 0)) * factor, 1),
+                    "fats_g": round(float(c.get("fats_g", 0)) * factor, 1),
+                    "from_db": False,
+                    "from_cache": True,
+                }
+
+        if not item_result:
+            # Try local nutrition_db
+            db_result = nutrition_db.calculate_nutrition(food_name, grams)
+            if db_result:
+                item_result = db_result
+            else:
+                # Generic estimate fallback
+                item_result = {
+                    "item": food_name,
+                    "grams": grams,
+                    "calories": round(grams * 1.2, 1),
+                    "protein_g": round(grams * 0.08, 1),
+                    "carbs_g": round(grams * 0.15, 1),
+                    "fats_g": round(grams * 0.05, 1),
+                    "from_db": False,
+                }
+
+        items.append(item_result)
+        total_cal += item_result["calories"]
+        total_pro += item_result["protein_g"]
+        total_carbs += item_result["carbs_g"]
+        total_fats += item_result["fats_g"]
 
     return {
         "items": items,
@@ -666,3 +705,151 @@ def calculate_weekly_review(user_id: int) -> dict:
         "blood_summary": blood_summary,
         "calorie_balance": calorie_balance,
     }
+
+
+# ============================================================================
+# CONTEXT INJECTION — 14-day user snapshot for conversational AI
+# ============================================================================
+
+def build_user_context(user_id: int) -> str:
+    """Fetch 14 days of data from ALL tabs and return a structured text block.
+
+    This context is injected into Gemini for free-form questions, analysis,
+    planning, education, and proactive insights.
+    """
+    profile = sheets.get_profile(user_id)
+    if not profile:
+        return ""
+
+    # --- Computed baselines ---
+    bmr = get_bmr_for_user(user_id)
+    tdee = get_tdee_for_user(user_id)
+    bmi_val = 0.0
+
+    # --- Food (14 days) ---
+    food = sheets.get_food(user_id, days=14)
+    today_food = [f for f in food if f.get("date") == sheets.today()]
+    today_cal = sum(float(f.get("calories", 0)) for f in today_food)
+    today_pro = sum(float(f.get("protein_g", 0)) for f in today_food)
+    today_carbs = sum(float(f.get("carbs_g", 0)) for f in today_food)
+    today_fats = sum(float(f.get("fats_g", 0)) for f in today_food)
+    remaining_cal = round(max(0, tdee - today_cal))
+    macro_targets = calculate_macro_targets(tdee)
+    remaining_pro = round(max(0, macro_targets["protein_g"] - today_pro))
+
+    days_with_food = {f.get("date") for f in food}
+    avg_cal_14d = round(
+        sum(float(f.get("calories", 0)) for f in food) / max(len(days_with_food), 1)
+    )
+
+    # --- Biometrics / Weight (14 days) ---
+    bio = sheets.get_biometrics(user_id, days=14)
+    weight_section = "אין מדידות אחרונות"
+    if bio:
+        latest = bio[-1]
+        w = float(latest.get("weight_kg", 0))
+        bmi_val = calculate_bmi(w, float(profile.get("height_cm", 170)))
+        weight_section = (
+            f"משקל אחרון: {w} ק\"ג | BMI: {bmi_val} ({bmi_category(bmi_val)})\n"
+            f"שומן: {latest.get('body_fat_pct', '?')}% | שריר: {latest.get('muscle_mass_kg', '?')} ק\"ג"
+        )
+        if len(bio) >= 2:
+            delta = round(float(bio[-1].get("weight_kg", 0)) - float(bio[0].get("weight_kg", 0)), 1)
+            weight_section += f"\nשינוי ב-14 יום: {delta:+.1f} ק\"ג"
+
+    # --- Hydration ---
+    hydration = sheets.get_hydration(user_id, days=14)
+    today_water = sum(
+        float(h.get("liters", 0)) for h in hydration if h.get("date") == sheets.today()
+    )
+    h_target = calculate_hydration_target(
+        exercise_entries=sheets.get_exercise(user_id, days=1)
+    )
+
+    # --- Exercise (14 days) ---
+    exercises = sheets.get_exercise(user_id, days=14)
+    today_ex = [e for e in exercises if e.get("date") == sheets.today()]
+    today_ex_kcal = sum(float(e.get("estimated_kcal", 0)) for e in today_ex)
+    ex_summary_lines = []
+    for e in exercises[-7:]:
+        ex_summary_lines.append(
+            f"  {e.get('date')}: {e.get('type')} {e.get('duration_min')}דק׳ "
+            f"עצימות {e.get('intensity')}/10 → {e.get('estimated_kcal')} קק\"ל"
+        )
+
+    # --- Sleep / Wearable (14 days) ---
+    wearable = sheets.get_wearable(user_id, days=14)
+    sleep_section = "אין נתוני שינה"
+    if wearable:
+        latest_w = wearable[-1]
+        avg_sleep = round(
+            sum(float(w.get("sleep_hours", 0)) for w in wearable) / len(wearable), 1
+        )
+        avg_steps = round(
+            sum(float(w.get("steps", 0)) for w in wearable) / len(wearable)
+        )
+        sleep_section = (
+            f"שינה אחרונה: {latest_w.get('sleep_hours')}h ({latest_w.get('sleep_quality')})\n"
+            f"ממוצע 14 יום: {avg_sleep}h שינה | {avg_steps} צעדים"
+        )
+
+    # --- Cycle ---
+    phase = sheets.get_current_phase(user_id)
+    cycle_section = "לא רלוונטי"
+    if phase:
+        adj = get_cycle_adjustments(phase)
+        cycle_section = (
+            f"שלב נוכחי: {phase}\n"
+            f"התאמת קלוריות: {adj['calorie_adjustment']:+d} | "
+            f"עצימות מומלצת: {adj['recommended_intensity']}\n"
+            f"{adj['weight_fluctuation_note']}\n"
+            f"ברזל: {adj['iron_note']}"
+        )
+
+    # --- Blood Work ---
+    blood = sheets.get_blood_work(user_id)
+    blood_section = "אין בדיקות דם"
+    if blood:
+        latest_blood = blood[-1]
+        ranges = check_blood_ranges(latest_blood)
+        flags = ranges.get("flags", [])
+        blood_section = f"בדיקה אחרונה: {latest_blood.get('date', '?')}\n"
+        if flags:
+            blood_section += "חריגים:\n" + "\n".join(f"  {f}" for f in flags)
+        else:
+            blood_section += "כל הסמנים תקינים"
+
+    # --- Assemble context ---
+    return f"""=== פרופיל ===
+{profile.get('name', '?')}, גיל {profile.get('age', '?')}, {profile.get('gender', '?')}
+גובה: {profile.get('height_cm', '?')}cm
+BMR: {bmr:.0f} | TDEE: {tdee:.0f} קק"ל
+
+=== משקל והרכב גוף ===
+{weight_section}
+
+=== תזונה היום ===
+קלוריות: {today_cal:.0f} / {tdee:.0f} (נותרו {remaining_cal})
+חלבון: {today_pro:.0f}g / {macro_targets['protein_g']}g (נותרו {remaining_pro}g)
+פחמימות: {today_carbs:.0f}g | שומן: {today_fats:.0f}g
+ממוצע 14 יום: {avg_cal_14d} קק"ל/יום
+
+=== שתייה ===
+היום: {today_water:.1f} / {h_target:.1f} ליטר
+
+=== אימונים (אחרונים) ===
+אימון היום: {today_ex_kcal:.0f} קק"ל ({len(today_ex)} אימונים)
+{chr(10).join(ex_summary_lines) if ex_summary_lines else "אין אימונים אחרונים"}
+
+=== שינה וצעדים ===
+{sleep_section}
+
+=== מחזור ===
+{cycle_section}
+
+=== בדיקות דם ===
+{blood_section}
+
+=== יעדי מאקרו יומיים ===
+חלבון: {macro_targets['protein_g']}g | פחמימות: {macro_targets['carbs_g']}g | שומן: {macro_targets['fats_g']}g
+"""

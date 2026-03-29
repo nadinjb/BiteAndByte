@@ -177,11 +177,14 @@ async def _process_food_text(update: Update, description: str) -> None:
     user_id = update.effective_user.id
     await update.message.reply_text("🔍 מזהה פריטי מזון...")
 
-    # STEP 1: Gemini EXTRACTS items + grams
-    extracted = gemini_client.extract_food_from_text(description)
+    # Check Food_Cache for known items
+    cached_items = sheets.lookup_food_cache(user_id, description)
 
-    # STEP 2: Python CALCULATES nutrition from local DB
-    nutrition = insights.calculate_food_nutrition(extracted)
+    # STEP 1: Gemini EXTRACTS items + grams (with cache context + explicit data rules)
+    extracted = gemini_client.extract_food_from_text(description, cached_items=cached_items)
+
+    # STEP 2: Python CALCULATES (explicit > cache > DB > estimate)
+    nutrition = insights.calculate_food_nutrition(extracted, user_id=user_id)
 
     total = nutrition
     item_names = ", ".join(i.get("item", "?") for i in nutrition["items"])
@@ -200,7 +203,14 @@ async def _process_food_text(update: Update, description: str) -> None:
 
     items_text = ""
     for item in nutrition["items"]:
-        src = "📗 DB" if item.get("from_db") else "📙 הערכה"
+        if item.get("explicit"):
+            src = "📌 מדויק"
+        elif item.get("from_cache"):
+            src = "📦 Cache"
+        elif item.get("from_db"):
+            src = "📗 DB"
+        else:
+            src = "📙 הערכה"
         items_text += (
             f"  • {item['item']} ({item['grams']:.0f}g) — "
             f"{item['calories']:.0f} קק\"ל [{src}]\n"
@@ -688,6 +698,113 @@ async def review_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 # ============================================================================
+# /fix — Update the last Food_Log entry
+# ============================================================================
+
+async def fix_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    usage = (
+        "שימוש: /fix <שדה> <ערך>\n"
+        "שדות: calories, protein, carbs, fats\n"
+        "דוגמה: /fix protein 25\n\n"
+        "מעדכן את הרישום האחרון בלבד."
+    )
+    args = context.args
+    if not args or len(args) < 2:
+        await update.message.reply_text(usage)
+        return
+
+    field = args[0].lower()
+    if field not in ("calories", "protein", "carbs", "fats"):
+        await update.message.reply_text(
+            f"⚠️ שדה לא מוכר: {field}\n"
+            "אפשרויות: calories, protein, carbs, fats"
+        )
+        return
+
+    try:
+        value = float(args[1])
+    except ValueError:
+        await update.message.reply_text("⚠️ הערך חייב להיות מספר.")
+        return
+
+    user_id = update.effective_user.id
+    updated = sheets.fix_last_food_entry(user_id, field, value)
+
+    if not updated:
+        await update.message.reply_text("⚠️ לא נמצא רישום אוכל לעדכון.")
+        return
+
+    heb_field = {"calories": "קלוריות", "protein": "חלבון", "carbs": "פחמימות", "fats": "שומן"}
+    await update.message.reply_text(
+        f"✅ עודכן! הרישום האחרון ({updated.get('item', '?')}):\n"
+        f"   {heb_field[field]}: {value}\n\n"
+        f"💡 כדי לשמור את הפריט לזיהוי עתידי, השתמש/י ב-/correct"
+    )
+
+
+# ============================================================================
+# /correct — Save corrected food item to Food_Cache (Rule #3)
+# ============================================================================
+
+async def correct_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    usage = (
+        "שימוש: /correct <שם פריט> <גרמים> <קלוריות> <חלבון> <פחמימות> <שומן>\n"
+        "דוגמה: /correct מולר 200 160 25 12 2\n\n"
+        "הפריט יישמר ויזוהה אוטומטית בפעם הבאה."
+    )
+    args = context.args
+    if not args or len(args) < 6:
+        await update.message.reply_text(usage)
+        return
+
+    item_name = args[0]
+    try:
+        grams = float(args[1])
+        calories = float(args[2])
+        protein = float(args[3])
+        carbs = float(args[4])
+        fats = float(args[5])
+    except ValueError:
+        await update.message.reply_text("⚠️ כל הערכים חייבים להיות מספרים.\n" + usage)
+        return
+
+    user_id = update.effective_user.id
+    sheets.save_food_cache(user_id, item_name, grams, calories, protein, carbs, fats)
+
+    await update.message.reply_text(
+        f"✅ נשמר ל-Food Cache!\n\n"
+        f"📦 {item_name} ({grams:.0f}g):\n"
+        f"   🔥 {calories:.0f} קק\"ל | P {protein:.0f}g | C {carbs:.0f}g | F {fats:.0f}g\n\n"
+        f"בפעם הבאה שתכתוב/י '{item_name}' — הערכים ייטענו אוטומטית."
+    )
+
+
+# ============================================================================
+# Free-text handler — Context Injection (catch-all, must be registered LAST)
+# ============================================================================
+
+async def free_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle any non-command text by answering with full 14-day context."""
+    user_id = update.effective_user.id
+    question = update.message.text.strip()
+
+    profile = sheets.get_profile(user_id)
+    if not profile:
+        await update.message.reply_text("⚠️ לא נמצא פרופיל. הפעל/י /start כדי להתחיל.")
+        return
+
+    user_context = insights.build_user_context(user_id)
+    try:
+        answer = gemini_client.answer_with_context(question, user_context)
+    except Exception:
+        logger.exception("Context answering failed")
+        await update.message.reply_text("⚠️ לא הצלחתי לעבד את ההודעה. נסה/י שוב.")
+        return
+
+    await _safe_reply(update.message, answer)
+
+
+# ============================================================================
 # Bot wiring
 # ============================================================================
 
@@ -748,10 +865,16 @@ def main() -> None:
     app.add_handler(CommandHandler("log_wearable", log_wearable_command))
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("review", review_command))
+    app.add_handler(CommandHandler("correct", correct_command))
+    app.add_handler(CommandHandler("fix", fix_command))
 
     # --- Photo handler (food / blood / scale detection) ---
 
     app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
+
+    # --- Free-text catch-all (MUST be last — catches unmatched text) ---
+
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, free_text_handler))
 
     logger.info("BiteAndByte bot starting...")
     app.run_polling()
