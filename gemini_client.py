@@ -1,4 +1,4 @@
-"""Gemini API client for BiteAndByte.
+"""Gemini API client for BiteAndByte — google-genai SDK (2026).
 
 STRICT ROLE SEPARATION:
   - Gemini EXTRACTS raw data (food items, grams, blood markers from images)
@@ -9,8 +9,10 @@ STRICT ROLE SEPARATION:
 import io
 import json
 import logging
+import time
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from PIL import Image
 
 import config
@@ -18,21 +20,19 @@ import config
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Initialization (lazy — models created on first use)
+# Client initialization (lazy — created on first use)
 # ---------------------------------------------------------------------------
 
-_flash_model = None
-_pro_model = None
+_client: genai.Client | None = None
 
 _SYSTEM_HEB = "אתה יועץ תזונה ובריאות מקצועי. ענה תמיד בעברית."
 
 
-def _init_models():
-    global _flash_model, _pro_model
-    if _flash_model is None:
-        genai.configure(api_key=config.GEMINI_API_KEY)
-        _flash_model = genai.GenerativeModel(config.GEMINI_FLASH)
-        _pro_model = genai.GenerativeModel(config.GEMINI_PRO)
+def _get_client() -> genai.Client:
+    global _client
+    if _client is None:
+        _client = genai.Client(api_key=config.GEMINI_API_KEY)
+    return _client
 
 
 # ---------------------------------------------------------------------------
@@ -43,36 +43,58 @@ def _load_image(image_bytes: bytes) -> Image.Image:
     return Image.open(io.BytesIO(image_bytes))
 
 
+def _call_with_retry(
+    model: str, contents, system: str | None = None, max_retries: int = 3,
+) -> str:
+    """Call Gemini with retry + backoff for 429 rate-limit errors."""
+    client = _get_client()
+    cfg = None
+    if system:
+        cfg = types.GenerateContentConfig(system_instruction=system)
+    for attempt in range(max_retries):
+        try:
+            resp = client.models.generate_content(
+                model=model, contents=contents, config=cfg,
+            )
+            return resp.text
+        except Exception as e:
+            err_str = str(e)
+            if "429" in err_str and attempt < max_retries - 1:
+                wait = (attempt + 1) * 6
+                logger.warning("%s rate-limited (429), retrying in %ds...", model, wait)
+                time.sleep(wait)
+                continue
+            logger.error("%s error: %s", model, e)
+            return ""
+    return ""
+
+
 def _ask_flash(prompt: str, image: Image.Image | None = None) -> str:
-    _init_models()
-    parts = [prompt]
-    if image:
-        parts.insert(0, image)
-    try:
-        resp = _flash_model.generate_content(parts)
-        return resp.text
-    except Exception as e:
-        logger.error("Gemini Flash error: %s", e)
-        return ""
+    contents = [image, prompt] if image else prompt
+    return _call_with_retry(config.GEMINI_FLASH, contents)
+
+
+def _ask_flash_system(prompt: str) -> str:
+    """Flash with Hebrew system instruction for feedback generation."""
+    return _call_with_retry(config.GEMINI_FLASH, prompt, system=_SYSTEM_HEB)
 
 
 def _ask_pro(prompt: str, image: Image.Image | None = None) -> str:
-    _init_models()
-    parts = [prompt]
-    if image:
-        parts.insert(0, image)
-    try:
-        resp = _pro_model.generate_content(parts)
-        return resp.text
-    except Exception as e:
-        logger.error("Gemini Pro error (falling back to Flash): %s", e)
-        # Fallback to Flash if Pro fails
-        try:
-            resp = _flash_model.generate_content(parts)
-            return resp.text
-        except Exception as e2:
-            logger.error("Gemini Flash fallback also failed: %s", e2)
-            return ""
+    contents = [image, prompt] if image else prompt
+    result = _call_with_retry(config.GEMINI_PRO, contents)
+    if not result:
+        logger.warning("Gemini Pro failed, falling back to Flash")
+        result = _call_with_retry(config.GEMINI_FLASH, contents)
+    return result
+
+
+def _ask_pro_system(prompt: str) -> str:
+    """Pro with Hebrew system instruction, Flash fallback."""
+    result = _call_with_retry(config.GEMINI_PRO, prompt, system=_SYSTEM_HEB)
+    if not result:
+        logger.warning("Gemini Pro failed, falling back to Flash")
+        result = _call_with_retry(config.GEMINI_FLASH, prompt, system=_SYSTEM_HEB)
+    return result
 
 
 def _parse_json(text: str, fallback: dict) -> dict:
@@ -89,6 +111,14 @@ def _parse_json(text: str, fallback: dict) -> dict:
         if start != -1 and end > start:
             try:
                 return json.loads(cleaned[start:end])
+            except json.JSONDecodeError:
+                pass
+        # Try array
+        arr_start = cleaned.find("[")
+        arr_end = cleaned.rfind("]") + 1
+        if arr_start != -1 and arr_end > arr_start:
+            try:
+                return json.loads(cleaned[arr_start:arr_end])
             except json.JSONDecodeError:
                 pass
         logger.warning("Failed to parse Gemini JSON response: %s", text[:200])
@@ -121,23 +151,17 @@ def extract_food_from_text(description: str) -> list[dict]:
     text = _ask_flash(prompt)
     result = _parse_json(text, fallback={"_list": []})
 
-    # Handle both list and dict responses
     if isinstance(result, list):
         return result
     if "_list" in result:
         return result["_list"]
-    # Single item wrapped in dict
     if "item" in result:
         return [result]
     return [{"item": description, "grams": 150}]
 
 
 def extract_food_from_photo(image_bytes: bytes) -> list[dict]:
-    """Extract food items and estimated grams from a photo.
-
-    Returns list of: {"item": "שם המאכל", "grams": 0}
-    Gemini only identifies — ZERO calorie math.
-    """
+    """Extract food items and estimated grams from a photo."""
     image = _load_image(image_bytes)
 
     prompt = """זהה את כל פריטי המזון בתמונה והערך את המשקל בגרמים לכל פריט.
@@ -160,29 +184,17 @@ def extract_food_from_photo(image_bytes: bytes) -> list[dict]:
 
 
 def extract_blood_markers(image_bytes: bytes) -> dict:
-    """Extract blood marker values from a screenshot.
-
-    Returns dict of marker_key: value (numbers only, no analysis).
-    Gemini only reads numbers — Python does the range-checking.
-    """
+    """Extract blood marker values from a screenshot (numbers only)."""
     image = _load_image(image_bytes)
 
     prompt = """חלץ את כל ערכי בדיקת הדם שאתה מזהה בתמונה.
 
 החזר JSON בלבד (בלי markdown):
 {
-  "glucose_mg_dl": null,
-  "hba1c_pct": null,
-  "cholesterol_total": null,
-  "hdl": null,
-  "ldl": null,
-  "triglycerides": null,
-  "iron": null,
-  "ferritin": null,
-  "vitamin_d": null,
-  "b12": null,
-  "tsh": null,
-  "crp": null
+  "glucose_mg_dl": null, "hba1c_pct": null, "cholesterol_total": null,
+  "hdl": null, "ldl": null, "triglycerides": null,
+  "iron": null, "ferritin": null, "vitamin_d": null,
+  "b12": null, "tsh": null, "crp": null
 }
 
 מלא רק ערכים שאתה מזהה. השאר null למה שלא מופיע.
@@ -193,12 +205,7 @@ def extract_blood_markers(image_bytes: bytes) -> dict:
 
 
 def extract_scale_metrics(image_bytes: bytes) -> dict:
-    """Extract body composition numbers from a smart scale screenshot.
-
-    Returns: {"weight_kg": 0, "body_fat_pct": 0, "water_pct": 0,
-              "bone_mass_kg": 0, "muscle_mass_kg": 0}
-    Gemini only reads numbers — ZERO analysis.
-    """
+    """Extract body composition numbers from a smart scale screenshot."""
     image = _load_image(image_bytes)
 
     prompt = """חלץ את נתוני הרכב הגוף מצילום המסך.
@@ -220,16 +227,7 @@ def extract_scale_metrics(image_bytes: bytes) -> dict:
 # ============================================================================
 
 def generate_food_feedback(calculated: dict) -> str:
-    """Generate Hebrew feedback for a logged meal.
-
-    `calculated` contains Python-computed values:
-      item, grams, calories, protein_g, carbs_g, fats_g,
-      daily_total_cal, daily_total_protein, tdee, remaining_cal,
-      hydration_status, from_db
-    """
-    prompt = f"""{_SYSTEM_HEB}
-
-המשתמש אכל/ה ואלה הנתונים שחושבו (כבר מחושב, אל תחשב מחדש!):
+    prompt = f"""המשתמש אכל/ה ואלה הנתונים שחושבו (כבר מחושב, אל תחשב מחדש!):
 
 פריט: {calculated.get('item', '?')}
 כמות: {calculated.get('grams', '?')}g
@@ -247,24 +245,15 @@ def generate_food_feedback(calculated: dict) -> str:
 - תובנה על האיזון התזונתי (מאקרוס)
 - המלצה קצרה לשאר היום
 אל תציג מספרים שונים מאלה שניתנו לך."""
-
-    return _ask_flash(prompt)
+    return _ask_flash_system(prompt)
 
 
 def generate_workout_feedback(calculated: dict) -> str:
-    """Generate Hebrew post-workout feedback from pre-calculated data.
-
-    `calculated` contains: exercise_type, duration_min, intensity,
-      calories_burned, updated_tdee, extra_water_l, protein_bump_g,
-      hydration_status, cycle_phase (optional)
-    """
     cycle_ctx = ""
     if calculated.get("cycle_phase"):
         cycle_ctx = f"\nשלב מחזור נוכחי: {calculated['cycle_phase']}"
 
-    prompt = f"""{_SYSTEM_HEB}
-
-המשתמש/ת סיים/ה אימון. נתונים מחושבים (אל תחשב מחדש!):
+    prompt = f"""המשתמש/ת סיים/ה אימון. נתונים מחושבים (אל תחשב מחדש!):
 
 סוג: {calculated.get('exercise_type', '?')}
 משך: {calculated.get('duration_min', 0)} דקות
@@ -281,22 +270,14 @@ TDEE מעודכן: {calculated.get('updated_tdee', 0)} קק"ל
 - עידוד מותאם לעצימות
 - אם יש שלב מחזור, התייחס אליו ברגישות
 אל תציג מספרים שונים מאלה שניתנו לך."""
-
-    return _ask_flash(prompt)
+    return _ask_flash_system(prompt)
 
 
 def generate_blood_feedback(calculated: dict) -> str:
-    """Generate Hebrew blood work analysis from pre-calculated range checks.
-
-    `calculated` contains: date, flags (list of out-of-range), ok (list of normal),
-      all_normal (bool)
-    """
     flags_str = "\n".join(calculated.get("flags", [])) or "אין"
     ok_str = "\n".join(calculated.get("ok", [])) or "אין"
 
-    prompt = f"""{_SYSTEM_HEB}
-
-תוצאות בדיקת דם מתאריך {calculated.get('date', '?')}.
+    prompt = f"""תוצאות בדיקת דם מתאריך {calculated.get('date', '?')}.
 הטווחים כבר נבדקו — הנה הסיכום (אל תחשב מחדש!):
 
 סמנים חריגים:
@@ -313,17 +294,10 @@ def generate_blood_feedback(calculated: dict) -> str:
 - תן 2-3 המלצות תזונתיות/אורח חיים ספציפיות
 - הדגש שזו אינה תחליף לייעוץ רפואי
 אל תציג ערכים שונים מאלה שניתנו לך."""
-
-    return _ask_pro(prompt)
+    return _ask_pro_system(prompt)
 
 
 def generate_scale_feedback(calculated: dict) -> str:
-    """Generate Hebrew body composition feedback from pre-calculated trends.
-
-    `calculated` contains: weight_kg, body_fat_pct, muscle_mass_kg,
-      bmi, bmi_category, weight_delta, fat_delta, muscle_delta,
-      cycle_phase (optional), cycle_weight_note (optional)
-    """
     cycle_ctx = ""
     if calculated.get("cycle_phase"):
         cycle_ctx = (
@@ -331,9 +305,7 @@ def generate_scale_feedback(calculated: dict) -> str:
             f"\n{calculated.get('cycle_weight_note', '')}"
         )
 
-    prompt = f"""{_SYSTEM_HEB}
-
-מדידת הרכב גוף חדשה. נתונים מחושבים (אל תחשב מחדש!):
+    prompt = f"""מדידת הרכב גוף חדשה. נתונים מחושבים (אל תחשב מחדש!):
 
 משקל: {calculated.get('weight_kg', 0)} ק"ג
 BMI: {calculated.get('bmi', 0)} ({calculated.get('bmi_category', '')})
@@ -351,19 +323,11 @@ BMI: {calculated.get('bmi', 0)} ({calculated.get('bmi_category', '')})
 - אם יש שלב מחזור, הסבר השפעתו על המשקל
 - המלצה קצרה
 אל תציג מספרים שונים מאלה שניתנו לך."""
-
-    return _ask_flash(prompt)
+    return _ask_flash_system(prompt)
 
 
 def generate_wearable_feedback(calculated: dict) -> str:
-    """Generate Hebrew morning insight from pre-calculated wearable data.
-
-    `calculated` contains: sleep_hours, sleep_quality, steps,
-      sleep_deficit, recommended_intensity, calorie_adjustment
-    """
-    prompt = f"""{_SYSTEM_HEB}
-
-נתוני שעון חכם (מחושב, אל תחשב מחדש!):
+    prompt = f"""נתוני שעון חכם (מחושב, אל תחשב מחדש!):
 
 שינה: {calculated.get('sleep_hours', 0)} שעות ({calculated.get('sleep_quality', '?')})
 גירעון שינה: {calculated.get('sleep_deficit', 0)} שעות
@@ -376,19 +340,11 @@ def generate_wearable_feedback(calculated: dict) -> str:
 - המלצת אימון מותאמת
 - טיפ תזונתי
 אל תציג מספרים שונים מאלה שניתנו לך."""
-
-    return _ask_flash(prompt)
+    return _ask_flash_system(prompt)
 
 
 def generate_cycle_feedback(calculated: dict) -> str:
-    """Generate Hebrew cycle-phase advice from pre-calculated adjustments.
-
-    `calculated` contains: phase, calorie_adjustment, iron_note,
-      water_adjustment_l, recommended_intensity, weight_fluctuation_note
-    """
-    prompt = f"""{_SYSTEM_HEB}
-
-המשתמשת בשלב ה-{calculated.get('phase', '?')} של המחזור.
+    prompt = f"""המשתמשת בשלב ה-{calculated.get('phase', '?')} של המחזור.
 
 התאמות מחושבות (אל תחשבי מחדש!):
 - התאמת קלוריות: {calculated.get('calorie_adjustment', 0):+.0f} קק"ל
@@ -402,25 +358,11 @@ def generate_cycle_feedback(calculated: dict) -> str:
 - שלבי את ההמלצות הנ"ל בצורה טבעית
 - תני הרגשה תומכת ואמפתית
 אל תציגי מספרים שונים מאלה שניתנו."""
-
-    return _ask_flash(prompt)
+    return _ask_flash_system(prompt)
 
 
 def generate_weekly_review(calculated: dict) -> str:
-    """Generate comprehensive Hebrew weekly review from pre-calculated data.
-
-    `calculated` contains ALL Python-computed metrics:
-      profile, bmr, tdee, bmi, bmi_category,
-      weight_trend, composition_trend, avg_daily_cal, macro_split,
-      macro_targets, hydration_avg, hydration_target,
-      exercise_summary, sleep_summary, cycle_info, blood_summary,
-      calorie_balance, protein_adherence
-    """
-    import json
-
-    prompt = f"""{_SYSTEM_HEB}
-
-כתוב סיכום שבועי מקיף. כל הנתונים כבר חושבו — אל תחשב מחדש!
+    prompt = f"""כתוב סיכום שבועי מקיף. כל הנתונים כבר חושבו — אל תחשב מחדש!
 
 {json.dumps(calculated, ensure_ascii=False, indent=2, default=str)}
 
@@ -435,19 +377,11 @@ def generate_weekly_review(calculated: dict) -> str:
 8. 💡 3 המלצות ספציפיות ומבוססות-נתונים לשבוע הבא
 
 השתמש באימוג'ים ופורמט ברור. הצג את המספרים שניתנו לך, לא אחרים."""
-
-    return _ask_pro(prompt)
+    return _ask_pro_system(prompt)
 
 
 def generate_status_feedback(calculated: dict) -> str:
-    """Generate short Hebrew daily status feedback from pre-calculated snapshot.
-
-    `calculated` contains: remaining_cal, protein_status, hydration_pct,
-      exercise_today, sleep_note, cycle_note
-    """
-    prompt = f"""{_SYSTEM_HEB}
-
-סטטוס יומי מחושב (אל תחשב מחדש!):
+    prompt = f"""סטטוס יומי מחושב (אל תחשב מחדש!):
 
 קלוריות נותרו: {calculated.get('remaining_cal', 0)} קק"ל
 חלבון: {calculated.get('protein_status', '')}
@@ -458,5 +392,4 @@ def generate_status_feedback(calculated: dict) -> str:
 
 תן טיפ יומי קצר (2-3 משפטים) בעברית — מה כדאי לעשות עד סוף היום.
 אל תציג מספרים שונים מאלה שניתנו לך."""
-
-    return _ask_flash(prompt)
+    return _ask_flash_system(prompt)

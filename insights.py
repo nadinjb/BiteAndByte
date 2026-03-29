@@ -7,7 +7,7 @@ hydration targets, blood range-checks, cycle adjustments, wearable scoring.
 """
 
 import config
-import sheets
+import sheets_handler as sheets
 import nutrition_db
 import gemini_client
 

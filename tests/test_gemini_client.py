@@ -4,10 +4,9 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# We need to mock genai before importing gemini_client
-from unittest.mock import patch, MagicMock
+# Patch env before importing gemini_client (needs GEMINI_API_KEY)
+from unittest.mock import patch
 
-# Patch genai at module level before import
 with patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}):
     import gemini_client
 

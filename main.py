@@ -1,20 +1,33 @@
-"""Telegram bot handlers — 3-step pipeline:
-  1. Gemini EXTRACTS raw data (food items, grams, markers)
-  2. Python CALCULATES (BMR, TDEE, calories, macros, ranges)
-  3. Gemini VERBALIZES (Hebrew feedback from pre-calculated results)
+"""BiteAndByte — Bio-Hacking & Health Telegram Bot.
+
+Powered by Gemini 2.5 Flash/Pro (google-genai SDK) + Google Sheets.
+
+Pipeline: Gemini extracts → Python calculates → Gemini verbalizes.
+All math is done in Python (insights.py). Gemini NEVER does math.
 """
 
 import logging
 
 from telegram import Update
-from telegram.ext import ContextTypes, ConversationHandler
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+    ConversationHandler,
+    MessageHandler,
+    filters,
+)
 from telegram.constants import ParseMode
 
 import config
-import sheets
+import sheets_handler as sheets
 import insights
 import gemini_client
 
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -31,11 +44,9 @@ BLOOD_INPUT = 10
 # ---------------------------------------------------------------------------
 
 async def _safe_reply(message, text: str) -> None:
-    """Send with Markdown, fallback to plain text if parsing fails."""
     try:
         await message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
     except Exception:
-        # Strip Markdown markers and send plain
         plain = text.replace("*", "").replace("_", "")
         await message.reply_text(plain)
 
@@ -103,7 +114,6 @@ async def get_weight(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         height_cm=d["height_cm"], initial_weight_kg=weight,
     )
 
-    # Python-calculated BMR & TDEE
     bmr = insights.calculate_bmr(weight, d["height_cm"], d["age"], d["gender"])
     tdee = insights.calculate_tdee(bmr, 0)
     bmi = insights.calculate_bmi(weight, d["height_cm"])
@@ -173,7 +183,6 @@ async def _process_food_text(update: Update, description: str) -> None:
     # STEP 2: Python CALCULATES nutrition from local DB
     nutrition = insights.calculate_food_nutrition(extracted)
 
-    # Save to sheets
     total = nutrition
     item_names = ", ".join(i.get("item", "?") for i in nutrition["items"])
     sheets.log_food(
@@ -189,7 +198,6 @@ async def _process_food_text(update: Update, description: str) -> None:
     tdee = insights.get_tdee_for_user(user_id)
     remaining = round(max(0, tdee - daily_cal))
 
-    # Build items detail
     items_text = ""
     for item in nutrition["items"]:
         src = "📗 DB" if item.get("from_db") else "📙 הערכה"
@@ -198,7 +206,6 @@ async def _process_food_text(update: Update, description: str) -> None:
             f"{item['calories']:.0f} קק\"ל [{src}]\n"
         )
 
-    # Hydration status
     h_goal = insights.calculate_hydration_target(
         exercise_entries=sheets.get_exercise(user_id, days=1)
     )
@@ -230,9 +237,10 @@ async def _process_food_text(update: Update, description: str) -> None:
         f"P {total['total_protein']:.0f}g | C {total['total_carbs']:.0f}g | "
         f"F {total['total_fats']:.0f}g\n\n"
         f"📈 יומי: {daily_cal:.0f} / {tdee:.0f} קק\"ל (נותרו {remaining})\n"
-        f"🥩 חלבון: {daily_pro:.0f}g\n\n"
-        f"🤖 {feedback}"
+        f"🥩 חלבון: {daily_pro:.0f}g"
     )
+    if feedback:
+        msg += f"\n\n🤖 {feedback}"
     await _safe_reply(update.message, msg)
 
 
@@ -258,14 +266,11 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def _handle_food_photo(update: Update, user_id: int, image_bytes: bytes) -> None:
     await update.message.reply_text("📸 שלב 1/3: מזהה פריטי מזון...")
 
-    # STEP 1: Gemini EXTRACTS items + grams from photo
     extracted = gemini_client.extract_food_from_photo(image_bytes)
 
     await update.message.reply_text("🔢 שלב 2/3: מחשב ערכים תזונתיים...")
 
-    # STEP 2: Python CALCULATES from local DB
     nutrition = insights.calculate_food_nutrition(extracted)
-
     item_names = ", ".join(i.get("item", "?") for i in nutrition["items"])
     sheets.log_food(
         user_id, item_names,
@@ -273,12 +278,10 @@ async def _handle_food_photo(update: Update, user_id: int, image_bytes: bytes) -
         nutrition["total_carbs"], nutrition["total_fats"],
     )
 
-    # Daily totals
     today_food = [f for f in sheets.get_food(user_id, days=1) if f.get("date") == sheets.today()]
     daily_cal = sum(float(f.get("calories", 0)) for f in today_food)
     tdee = insights.get_tdee_for_user(user_id)
 
-    # STEP 3: Gemini VERBALIZES
     feedback = gemini_client.generate_food_feedback({
         "item": item_names,
         "grams": sum(i.get("grams", 0) for i in nutrition["items"]),
@@ -301,23 +304,20 @@ async def _handle_food_photo(update: Update, user_id: int, image_bytes: bytes) -
     msg = (
         f"✅ מהתמונה:\n{items_text}\n\n"
         f"📊 סה\"כ: {nutrition['total_calories']:.0f} קק\"ל\n"
-        f"📈 יומי: {daily_cal:.0f} / {tdee:.0f} קק\"ל\n\n"
-        f"🤖 {feedback}"
+        f"📈 יומי: {daily_cal:.0f} / {tdee:.0f} קק\"ל"
     )
+    if feedback:
+        msg += f"\n\n🤖 {feedback}"
     await _safe_reply(update.message, msg)
 
 
 async def _handle_blood_photo(update: Update, user_id: int, image_bytes: bytes) -> None:
     await update.message.reply_text("🩸 שלב 1/3: מחלץ סמנים מהתמונה (Gemini Pro)...")
 
-    # STEP 1: Gemini EXTRACTS marker numbers
     markers = gemini_client.extract_blood_markers(image_bytes)
-
-    # STEP 2: Python CALCULATES range checks
     clean = {k: v for k, v in markers.items() if v is not None and k != "_raw"}
     calculated = insights.calculate_blood_analysis(user_id, clean)
 
-    # STEP 3: Gemini VERBALIZES from pre-calculated ranges
     await update.message.reply_text("🔢 שלב 2/3: בודק טווחים...")
     feedback = gemini_client.generate_blood_feedback(calculated)
 
@@ -328,16 +328,13 @@ async def _handle_blood_photo(update: Update, user_id: int, image_bytes: bytes) 
     if ok_text:
         msg += f"תקינים:\n{ok_text}\n\n"
     msg += f"🤖 ניתוח:\n{feedback}"
-
     await _safe_reply(update.message, msg)
 
 
 async def _handle_scale_photo(update: Update, user_id: int, image_bytes: bytes) -> None:
     await update.message.reply_text("⚖️ שלב 1/3: מחלץ נתונים מהמשקל...")
 
-    # STEP 1: Gemini EXTRACTS numbers
     raw = gemini_client.extract_scale_metrics(image_bytes)
-
     weight = float(raw.get("weight_kg", 0))
     if weight <= 0:
         await update.message.reply_text(
@@ -345,7 +342,6 @@ async def _handle_scale_photo(update: Update, user_id: int, image_bytes: bytes) 
         )
         return
 
-    # STEP 2: Python CALCULATES BMI, deltas, cycle adjustments
     calculated = insights.calculate_scale_data(
         user_id, weight,
         float(raw.get("body_fat_pct", 0)),
@@ -354,9 +350,7 @@ async def _handle_scale_photo(update: Update, user_id: int, image_bytes: bytes) 
         float(raw.get("muscle_mass_kg", 0)),
     )
 
-    # STEP 3: Gemini VERBALIZES
     feedback = gemini_client.generate_scale_feedback(calculated)
-
     msg = (
         f"✅ נרשם: {weight}kg | BMI {calculated['bmi']} ({calculated['bmi_category']})\n\n"
         f"🤖 {feedback}"
@@ -383,7 +377,6 @@ async def log_water_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     user_id = update.effective_user.id
     sheets.log_hydration(user_id, liters)
 
-    # Python-calculated status
     goal = insights.calculate_hydration_target(
         exercise_entries=sheets.get_exercise(user_id, days=1)
     )
@@ -401,7 +394,7 @@ async def log_water_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 # ============================================================================
-# /log_workout — Gemini verbalizes pre-calculated workout data
+# /log_workout
 # ============================================================================
 
 async def log_workout_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -435,11 +428,7 @@ async def log_workout_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     user_id = update.effective_user.id
-
-    # STEP 2: Python CALCULATES everything
     calculated = insights.calculate_workout_data(user_id, exercise_type, duration, intensity)
-
-    # STEP 3: Gemini VERBALIZES
     feedback = gemini_client.generate_workout_feedback(calculated)
 
     msg = (
@@ -450,8 +439,8 @@ async def log_workout_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
     if calculated["protein_bump_g"] > 0:
         msg += f"🥩 חלבון נוסף: +{calculated['protein_bump_g']}g\n"
-    msg += f"\n🤖 {feedback}"
-
+    if feedback:
+        msg += f"\n🤖 {feedback}"
     await _safe_reply(update.message, msg)
 
 
@@ -477,11 +466,7 @@ async def log_scale_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     user_id = update.effective_user.id
-
-    # STEP 2: Python CALCULATES
     calculated = insights.calculate_scale_data(user_id, weight, fat, water, bone, muscle)
-
-    # STEP 3: Gemini VERBALIZES
     feedback = gemini_client.generate_scale_feedback(calculated)
 
     msg = (
@@ -493,7 +478,7 @@ async def log_scale_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 # ============================================================================
-# /log_cycle — Python calculates adjustments → Gemini verbalizes
+# /log_cycle
 # ============================================================================
 
 async def log_cycle_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -518,11 +503,8 @@ async def log_cycle_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     user_id = update.effective_user.id
     sheets.log_cycle(user_id, phase, notes)
 
-    # STEP 2: Python CALCULATES cycle adjustments
     adjustments = insights.get_cycle_adjustments(phase)
     calculated = {"phase": phase, **adjustments}
-
-    # STEP 3: Gemini VERBALIZES
     feedback = gemini_client.generate_cycle_feedback(calculated)
 
     msg = (
@@ -601,11 +583,7 @@ async def blood_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def _save_blood_manual(update: Update, context: ContextTypes.DEFAULT_TYPE, markers: dict) -> int:
     user_id = update.effective_user.id
-
-    # STEP 2: Python CALCULATES ranges
     calculated = insights.calculate_blood_analysis(user_id, markers)
-
-    # STEP 3: Gemini VERBALIZES
     feedback = gemini_client.generate_blood_feedback(calculated)
 
     flags_text = "\n".join(calculated.get("flags", [])) or "🎉 הכל תקין!"
@@ -615,7 +593,7 @@ async def _save_blood_manual(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
 
 # ============================================================================
-# /log_wearable — Python calculates → Gemini verbalizes
+# /log_wearable
 # ============================================================================
 
 async def log_wearable_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -644,10 +622,7 @@ async def log_wearable_command(update: Update, context: ContextTypes.DEFAULT_TYP
     user_id = update.effective_user.id
     sheets.log_wearable(user_id, steps, sleep_hours, sleep_quality)
 
-    # STEP 2: Python CALCULATES
     calculated = insights.calculate_wearable_insights(sleep_hours, sleep_quality, steps)
-
-    # STEP 3: Gemini VERBALIZES
     feedback = gemini_client.generate_wearable_feedback(calculated)
 
     msg = (
@@ -662,7 +637,7 @@ async def log_wearable_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 # ============================================================================
-# /status — Python calculates → Gemini gives daily tip
+# /status
 # ============================================================================
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -673,7 +648,6 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("⚠️ לא נמצא פרופיל. הפעל/י /start")
         return
 
-    # Gemini daily tip from pre-calculated data
     tip = gemini_client.generate_status_feedback(calculated)
 
     msg = (
@@ -693,7 +667,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 # ============================================================================
-# /review — Python pre-calculates everything → Gemini Pro writes review
+# /review
 # ============================================================================
 
 async def review_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -705,13 +679,83 @@ async def review_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     await update.message.reply_text("🔢 מחשב נתונים שבועיים...")
-
-    # STEP 2: Python CALCULATES everything
     calculated = insights.calculate_weekly_review(user_id)
 
     await update.message.reply_text("🤖 Gemini Pro כותב סיכום...")
-
-    # STEP 3: Gemini Pro VERBALIZES
     review = gemini_client.generate_weekly_review(calculated)
 
     await _safe_reply(update.message, review)
+
+
+# ============================================================================
+# Bot wiring
+# ============================================================================
+
+def main() -> None:
+    if not config.TELEGRAM_BOT_TOKEN:
+        raise SystemExit("TELEGRAM_BOT_TOKEN is not set. Check your .env file.")
+    if not config.GOOGLE_SHEET_ID:
+        raise SystemExit("GOOGLE_SHEET_ID is not set. Check your .env file.")
+    if not config.GEMINI_API_KEY:
+        raise SystemExit("GEMINI_API_KEY is not set. Check your .env file.")
+
+    app = ApplicationBuilder().token(config.TELEGRAM_BOT_TOKEN).build()
+
+    # --- Conversation handlers ---
+
+    profile_conv = ConversationHandler(
+        entry_points=[CommandHandler("start", start_command)],
+        states={
+            NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_name)],
+            AGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_age)],
+            GENDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_gender)],
+            HEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_height)],
+            WEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_weight)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
+    blood_conv = ConversationHandler(
+        entry_points=[CommandHandler("upload_blood", upload_blood_command)],
+        states={
+            BLOOD_INPUT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, blood_input_handler),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
+    food_conv = ConversationHandler(
+        entry_points=[CommandHandler("log_food", log_food_command)],
+        states={
+            FOOD_INPUT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, food_input_handler),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
+    app.add_handler(profile_conv)
+    app.add_handler(blood_conv)
+    app.add_handler(food_conv)
+
+    # --- Simple command handlers ---
+
+    app.add_handler(CommandHandler("log_water", log_water_command))
+    app.add_handler(CommandHandler("log_workout", log_workout_command))
+    app.add_handler(CommandHandler("log_scale", log_scale_command))
+    app.add_handler(CommandHandler("log_cycle", log_cycle_command))
+    app.add_handler(CommandHandler("log_wearable", log_wearable_command))
+    app.add_handler(CommandHandler("status", status_command))
+    app.add_handler(CommandHandler("review", review_command))
+
+    # --- Photo handler (food / blood / scale detection) ---
+
+    app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
+
+    logger.info("BiteAndByte bot starting...")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()

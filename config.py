@@ -9,17 +9,17 @@ GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 GOOGLE_CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE", "credentials.json")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# --- Gemini models (cost optimization) ---
-GEMINI_FLASH = "gemini-2.0-flash"   # Free-tier daily logging
-GEMINI_PRO = "gemini-2.5-pro-preview-05-06"  # Complex reviews & blood analysis
+# --- Gemini models (google-genai 2026 SDK) ---
+GEMINI_FLASH = "gemini-2.5-flash"       # Default — daily logging & extraction
+GEMINI_PRO = "gemini-2.5-pro"           # Complex reviews & blood analysis
 
 # --- Google Sheets worksheet names ---
-WS_PROFILES = "User_Profile"
-WS_BIOMETRICS = "Biometric_Data"
+WS_PROFILES = "User_Profiles"
+WS_BIOMETRICS = "Biometrics"
 WS_FOOD = "Food_Log"
-WS_HYDRATION = "Hydration_Log"
-WS_EXERCISE = "Exercise_Log"
-WS_CYCLE = "Cycle_Tracking"
+WS_HYDRATION = "Hydration"
+WS_EXERCISE = "Workouts"
+WS_CYCLE = "Cycle_Data"
 WS_BLOOD = "Blood_Work"
 WS_WEARABLE = "Wearable_Sync"
 
