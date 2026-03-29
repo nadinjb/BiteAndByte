@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 NAME, AGE, GENDER, HEIGHT, WEIGHT = range(5)
+FOOD_INPUT = 6
 BLOOD_INPUT = 10
 
 
@@ -139,19 +140,31 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 # /log_food — 3-step: Gemini extracts → Python calculates → Gemini verbalizes
 # ============================================================================
 
-async def log_food_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def log_food_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     args = context.args
     if not args:
         await update.message.reply_text(
-            "🍽️ רישום אוכל\n\n"
-            "טקסט: /log_food חזה עוף 200 גרם עם אורז\n"
-            "תמונה: שלח/י תמונה עם הכיתוב 'אוכל'\n\n"
-            "Gemini מזהה → Python מחשב → Gemini נותן פידבק!",
+            "🍽️ מה אכלת? כתוב/י את הארוחה.\n"
+            "דוגמה: חזה עוף 200 גרם עם אורז",
         )
-        return
+        return FOOD_INPUT
 
-    user_id = update.effective_user.id
     description = " ".join(args)
+    await _process_food_text(update, description)
+    return ConversationHandler.END
+
+
+async def food_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    description = update.message.text.strip()
+    if not description:
+        await update.message.reply_text("⚠️ נא לכתוב מה אכלת.")
+        return FOOD_INPUT
+    await _process_food_text(update, description)
+    return ConversationHandler.END
+
+
+async def _process_food_text(update: Update, description: str) -> None:
+    user_id = update.effective_user.id
     await update.message.reply_text("🔍 מזהה פריטי מזון...")
 
     # STEP 1: Gemini EXTRACTS items + grams

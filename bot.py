@@ -57,12 +57,22 @@ def main() -> None:
         fallbacks=[CommandHandler("cancel", handlers.cancel)],
     )
 
+    food_conv = ConversationHandler(
+        entry_points=[CommandHandler("log_food", handlers.log_food_command)],
+        states={
+            handlers.FOOD_INPUT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handlers.food_input_handler),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", handlers.cancel)],
+    )
+
     app.add_handler(profile_conv)
     app.add_handler(blood_conv)
+    app.add_handler(food_conv)
 
     # --- Simple command handlers ---
 
-    app.add_handler(CommandHandler("log_food", handlers.log_food_command))
     app.add_handler(CommandHandler("log_water", handlers.log_water_command))
     app.add_handler(CommandHandler("log_workout", handlers.log_workout_command))
     app.add_handler(CommandHandler("log_scale", handlers.log_scale_command))
