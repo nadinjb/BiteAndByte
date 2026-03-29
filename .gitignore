@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.env
+credentials.json
+*.json
+!package.json
+venv/
+.venv/
