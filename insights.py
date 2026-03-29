@@ -358,14 +358,27 @@ def calculate_food_nutrition(extracted_items: list[dict], user_id: int = 0) -> d
     total_fats = 0.0
 
     for entry in extracted_items:
-        food_name = entry.get("item", "")
-        grams = float(entry.get("grams", 150))
+        if not isinstance(entry, dict) or not entry.get("item"):
+            continue
+        food_name = str(entry.get("item", ""))
+        try:
+            grams = float(entry.get("grams") or 150)
+        except (ValueError, TypeError):
+            grams = 150.0
 
         # Check for explicit values from user (Rule #1)
-        explicit_cal = entry.get("calories")
-        explicit_pro = entry.get("protein_g")
-        explicit_carbs = entry.get("carbs_g")
-        explicit_fats = entry.get("fats_g")
+        def _safe_float(val):
+            if val is None:
+                return None
+            try:
+                return float(val)
+            except (ValueError, TypeError):
+                return None
+
+        explicit_cal = _safe_float(entry.get("calories"))
+        explicit_pro = _safe_float(entry.get("protein_g"))
+        explicit_carbs = _safe_float(entry.get("carbs_g"))
+        explicit_fats = _safe_float(entry.get("fats_g"))
         has_explicit = any(v is not None for v in [explicit_cal, explicit_pro, explicit_carbs, explicit_fats])
 
         item_result = None

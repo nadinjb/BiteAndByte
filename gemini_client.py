@@ -171,10 +171,12 @@ def extract_food_from_text(description: str, cached_items: list[dict] | None = N
     result = _parse_json(text, fallback={"_list": []})
 
     if isinstance(result, list):
-        return result
-    if "_list" in result:
+        # Filter out invalid entries (must have "item" key)
+        valid = [r for r in result if isinstance(r, dict) and r.get("item")]
+        return valid if valid else [{"item": description, "grams": 150}]
+    if "_list" in result and isinstance(result["_list"], list) and result["_list"]:
         return result["_list"]
-    if "item" in result:
+    if "item" in result and result["item"]:
         return [result]
     return [{"item": description, "grams": 150}]
 
@@ -434,4 +436,48 @@ def answer_with_context(question: str, user_context: str) -> str:
 - 4-8 משפטים, עברית, אימוג'ים.
 הודעת המשתמש/ת: "{question}"
 """
+    return _call_with_retry(config.GEMINI_FLASH, prompt, system=_SYSTEM_HEB)
+
+
+# ---------------------------------------------------------------------------
+# Reddit research analysis
+# ---------------------------------------------------------------------------
+
+def analyze_reddit_research(topic: str, reddit_data: str, user_context: str) -> str:
+    """Compare Reddit community advice to user's personal health data."""
+    prompt = f"""אתה יועץ תזונה ובריאות מקצועי. קיבלת נושא מחקר מהמשתמש/ת ונתוני קהילה מרדיט.
+
+נושא: "{topic}"
+
+=== דיונים מרדיט ===
+{reddit_data}
+
+=== הנתונים האישיים של המשתמש/ת ===
+{user_context}
+
+=== הוראות ===
+נתח את המידע מרדיט והשווה אותו לפרופיל האישי של המשתמש/ת.
+
+כתוב בעברית במבנה הבא:
+
+🔬 *נושא: {topic}*
+
+✅ *יתרונות (לפי הקהילה):*
+- 3-5 נקודות מרכזיות שעלו בדיונים
+
+⚠️ *חסרונות וסיכונים:*
+- 3-5 נקודות אזהרה שעלו בדיונים
+
+📊 *קונצנזוס הקהילה:*
+- מה רוב האנשים מסכימים עליו?
+- האם יש מחלוקות?
+
+🎯 *ההמלצה האישית שלך:*
+- התאם/י את המסקנות לנתונים האישיים (משקל, בדיקות דם, אימונים, מחזור אם רלוונטי)
+- ציין/י אם זה מתאים או לא מתאים למצב הספציפי של המשתמש/ת
+- 2-3 המלצות קונקרטיות
+
+⚕️ *הערה:* זוהי סקירת קהילה ולא ייעוץ רפואי מקצועי.
+
+השתמש רק במספרים מהנתונים. אל תמציא."""
     return _call_with_retry(config.GEMINI_FLASH, prompt, system=_SYSTEM_HEB)

@@ -24,6 +24,7 @@ import config
 import sheets_handler as sheets
 import insights
 import gemini_client
+import reddit_research
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -174,7 +175,8 @@ HELP_TEXT = (
     "   שלבים: follicular, ovulation, luteal, menstrual\n\n"
     "📊 *דוחות*\n"
     "/status — סטטוס יומי\n"
-    "/review — סיכום שבועי AI\n\n"
+    "/review — סיכום שבועי AI\n"
+    "/research <נושא> — מחקר רדיט + ניתוח אישי\n\n"
     "📸 *תמונות*\n"
     "שלח/י תמונה עם כיתוב: אוכל / דם / משקל\n\n"
     "💬 *שיחה חופשית*\n"
@@ -217,81 +219,104 @@ async def _process_food_text(update: Update, description: str) -> None:
     user_id = update.effective_user.id
     await update.message.reply_text("🔍 מזהה פריטי מזון...")
 
-    # Check Food_Cache for known items
-    cached_items = sheets.lookup_food_cache(user_id, description)
+    try:
+        # Check Food_Cache for known items
+        cached_items = sheets.lookup_food_cache(user_id, description)
 
-    # STEP 1: Gemini EXTRACTS items + grams (with cache context + explicit data rules)
-    extracted = gemini_client.extract_food_from_text(description, cached_items=cached_items)
+        # STEP 1: Gemini EXTRACTS items + grams (with cache context + explicit data rules)
+        extracted = gemini_client.extract_food_from_text(description, cached_items=cached_items)
 
-    # STEP 2: Python CALCULATES (explicit > cache > DB > estimate)
-    nutrition = insights.calculate_food_nutrition(extracted, user_id=user_id)
+        if not extracted or not isinstance(extracted, list):
+            await update.message.reply_text(
+                "⚠️ לא הצלחתי לזהות פריטי מזון. נסה/י שוב עם תיאור מפורט יותר.\n"
+                "דוגמה: חזה עוף 200 גרם עם אורז"
+            )
+            return
 
-    total = nutrition
-    item_names = ", ".join(i.get("item", "?") for i in nutrition["items"])
-    sheets.log_food(
-        user_id, item_names,
-        total["total_calories"], total["total_protein"],
-        total["total_carbs"], total["total_fats"],
-    )
+        # STEP 2: Python CALCULATES (explicit > cache > DB > estimate)
+        nutrition = insights.calculate_food_nutrition(extracted, user_id=user_id)
 
-    # Daily totals (Python math)
-    today_food = [f for f in sheets.get_food(user_id, days=1) if f.get("date") == sheets.today()]
-    daily_cal = sum(float(f.get("calories", 0)) for f in today_food)
-    daily_pro = sum(float(f.get("protein_g", 0)) for f in today_food)
-    tdee = insights.get_tdee_for_user(user_id)
-    remaining = round(max(0, tdee - daily_cal))
+        if not nutrition["items"]:
+            await update.message.reply_text(
+                "⚠️ לא הצלחתי לחשב ערכים תזונתיים. נסה/י שוב."
+            )
+            return
 
-    items_text = ""
-    for item in nutrition["items"]:
-        if item.get("explicit"):
-            src = "📌 מדויק"
-        elif item.get("from_cache"):
-            src = "📦 Cache"
-        elif item.get("from_db"):
-            src = "📗 DB"
-        else:
-            src = "📙 הערכה"
-        items_text += (
-            f"  • {item['item']} ({item['grams']:.0f}g) — "
-            f"{item['calories']:.0f} קק\"ל [{src}]\n"
+        total = nutrition
+        item_names = ", ".join(i.get("item", "?") for i in nutrition["items"])
+        sheets.log_food(
+            user_id, item_names,
+            total["total_calories"], total["total_protein"],
+            total["total_carbs"], total["total_fats"],
         )
 
-    h_goal = insights.calculate_hydration_target(
-        exercise_entries=sheets.get_exercise(user_id, days=1)
-    )
-    h_consumed = sum(
-        float(r.get("liters", 0))
-        for r in sheets.get_hydration(user_id, days=1)
-    )
-    h_status = f"{h_consumed:.1f} / {h_goal:.1f} ליטר"
+        # Daily totals (Python math)
+        today_food = [f for f in sheets.get_food(user_id, days=1) if f.get("date") == sheets.today()]
+        daily_cal = sum(float(f.get("calories", 0)) for f in today_food)
+        daily_pro = sum(float(f.get("protein_g", 0)) for f in today_food)
+        tdee = insights.get_tdee_for_user(user_id)
+        remaining = round(max(0, tdee - daily_cal))
 
-    # STEP 3: Gemini VERBALIZES from pre-calculated data
-    feedback = gemini_client.generate_food_feedback({
-        "item": item_names,
-        "grams": sum(i.get("grams", 0) for i in nutrition["items"]),
-        "calories": total["total_calories"],
-        "protein_g": total["total_protein"],
-        "carbs_g": total["total_carbs"],
-        "fats_g": total["total_fats"],
-        "daily_total_cal": round(daily_cal),
-        "daily_total_protein": round(daily_pro),
-        "tdee": round(tdee),
-        "remaining_cal": remaining,
-        "hydration_status": h_status,
-        "from_db": all(i.get("from_db") for i in nutrition["items"]),
-    })
+        items_text = ""
+        for item in nutrition["items"]:
+            if item.get("explicit"):
+                src = "📌 מדויק"
+            elif item.get("from_cache"):
+                src = "📦 Cache"
+            elif item.get("from_db"):
+                src = "📗 DB"
+            else:
+                src = "📙 הערכה"
+            cal = float(item.get("calories", 0) or 0)
+            grams = float(item.get("grams", 0) or 0)
+            items_text += (
+                f"  • {item['item']} ({grams:.0f}g) — "
+                f"{cal:.0f} קק\"ל [{src}]\n"
+            )
 
-    msg = (
-        f"✅ נרשם:\n{items_text}\n"
-        f"📊 סה\"כ: {total['total_calories']:.0f} קק\"ל | "
-        f"P {total['total_protein']:.0f}g | C {total['total_carbs']:.0f}g | "
-        f"F {total['total_fats']:.0f}g\n\n"
-        f"📈 יומי: {daily_cal:.0f} / {tdee:.0f} קק\"ל (נותרו {remaining})\n"
-        f"🥩 חלבון: {daily_pro:.0f}g"
-    )
-    if feedback:
-        msg += f"\n\n🤖 {feedback}"
-    await _safe_reply(update.message, msg)
+        h_goal = insights.calculate_hydration_target(
+            exercise_entries=sheets.get_exercise(user_id, days=1)
+        )
+        h_consumed = sum(
+            float(r.get("liters", 0))
+            for r in sheets.get_hydration(user_id, days=1)
+        )
+        h_status = f"{h_consumed:.1f} / {h_goal:.1f} ליטר"
+
+        # STEP 3: Gemini VERBALIZES from pre-calculated data
+        feedback = gemini_client.generate_food_feedback({
+            "item": item_names,
+            "grams": sum(float(i.get("grams", 0) or 0) for i in nutrition["items"]),
+            "calories": total["total_calories"],
+            "protein_g": total["total_protein"],
+            "carbs_g": total["total_carbs"],
+            "fats_g": total["total_fats"],
+            "daily_total_cal": round(daily_cal),
+            "daily_total_protein": round(daily_pro),
+            "tdee": round(tdee),
+            "remaining_cal": remaining,
+            "hydration_status": h_status,
+            "from_db": all(i.get("from_db") for i in nutrition["items"]),
+        })
+
+        msg = (
+            f"✅ נרשם:\n{items_text}\n"
+            f"📊 סה\"כ: {total['total_calories']:.0f} קק\"ל | "
+            f"P {total['total_protein']:.0f}g | C {total['total_carbs']:.0f}g | "
+            f"F {total['total_fats']:.0f}g\n\n"
+            f"📈 יומי: {daily_cal:.0f} / {tdee:.0f} קק\"ל (נותרו {remaining})\n"
+            f"🥩 חלבון: {daily_pro:.0f}g"
+        )
+        if feedback:
+            msg += f"\n\n🤖 {feedback}"
+        await _safe_reply(update.message, msg)
+
+    except Exception:
+        logger.exception("Food processing failed for: %s", description)
+        await update.message.reply_text(
+            "⚠️ שגיאה בעיבוד הארוחה. נסה/י שוב.\n"
+            "אם הבעיה חוזרת, נסה/י תיאור קצר יותר."
+        )
 
 
 # ============================================================================
@@ -820,6 +845,84 @@ async def correct_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 # ============================================================================
+# /research — Reddit community research with personal analysis
+# ============================================================================
+
+async def research_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+
+    if not config.REDDIT_CLIENT_ID:
+        await update.message.reply_text("⚠️ Reddit API לא מוגדר. הוסף/י REDDIT_CLIENT_ID ל-.env")
+        return
+
+    profile = sheets.get_profile(user_id)
+    if not profile:
+        await update.message.reply_text("⚠️ לא נמצא פרופיל. הפעל/י /start")
+        return
+
+    topic = " ".join(context.args) if context.args else ""
+    if not topic:
+        await update.message.reply_text(
+            "שימוש: /research <נושא>\n"
+            "דוגמה: /research creatine\n"
+            "דוגמה: /research intermittent fasting\n"
+            "דוגמה: /research magnesium supplement"
+        )
+        return
+
+    # 1. Immediate ACK
+    ack_msg = await update.message.reply_text(
+        f"🔎 מחפש דיונים על *{topic}* ב-Reddit...",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+    # 2. Typing indicator + slow warning
+    typing_task = asyncio.create_task(
+        _typing_loop(update.effective_chat.id, context.bot)
+    )
+    warning_task = asyncio.create_task(_slow_warning(ack_msg))
+
+    try:
+        # 3. Fetch Reddit threads (praw is synchronous — run in executor)
+        loop = asyncio.get_running_loop()
+        threads = await loop.run_in_executor(
+            None, reddit_research.search_reddit, topic,
+        )
+
+        if not threads:
+            typing_task.cancel()
+            warning_task.cancel()
+            await ack_msg.edit_text(f"לא נמצאו דיונים רלוונטיים על '{topic}' ברדיט.")
+            return
+
+        await ack_msg.edit_text(
+            f"📚 נמצאו {len(threads)} דיונים. מנתח עם Gemini..."
+        )
+
+        # 4. Build personal context + format Reddit data
+        user_context = insights.build_user_context(user_id)
+        reddit_data = reddit_research.format_reddit_data(threads)
+
+        # 5. Gemini analysis (also synchronous — run in executor)
+        analysis = await loop.run_in_executor(
+            None,
+            gemini_client.analyze_reddit_research,
+            topic, reddit_data, user_context,
+        )
+    except Exception:
+        logger.exception("Reddit research failed for topic: %s", topic)
+        typing_task.cancel()
+        warning_task.cancel()
+        await ack_msg.edit_text("⚠️ שגיאה בחיפוש ברדיט. נסה/י שוב מאוחר יותר.")
+        return
+
+    # 6. Edit ACK with final answer
+    typing_task.cancel()
+    warning_task.cancel()
+    await _edit_safe(ack_msg, analysis)
+
+
+# ============================================================================
 # Free-text handler — Context Injection (catch-all, must be registered LAST)
 # ============================================================================
 
@@ -968,6 +1071,7 @@ def main() -> None:
     app.add_handler(CommandHandler("review", review_command))
     app.add_handler(CommandHandler("correct", correct_command))
     app.add_handler(CommandHandler("fix", fix_command))
+    app.add_handler(CommandHandler("research", research_command))
 
     # --- Photo handler (food / blood / scale detection) ---
 

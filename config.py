@@ -9,6 +9,14 @@ GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 GOOGLE_CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE", "credentials.json")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
+# --- Reddit API (free tier, read-only) ---
+REDDIT_CLIENT_ID = os.getenv("REDDIT_CLIENT_ID")
+REDDIT_CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET")
+REDDIT_USER_AGENT = os.getenv(
+    "REDDIT_USER_AGENT", "BiteAndByte:v1.0 (by /u/BiteAndByteBot)"
+)
+REDDIT_SUBREDDITS = ["Biohacking", "Nutrition", "Fitness"]
+
 # --- Gemini models (google-genai 2026 SDK) ---
 GEMINI_FLASH = "gemini-2.5-flash"       # Default — daily logging & extraction
 GEMINI_PRO = "gemini-2.5-pro"           # Complex reviews & blood analysis
