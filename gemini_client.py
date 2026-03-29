@@ -18,15 +18,21 @@ import config
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Initialization
+# Initialization (lazy — models created on first use)
 # ---------------------------------------------------------------------------
 
-genai.configure(api_key=config.GEMINI_API_KEY)
-
-_flash_model = genai.GenerativeModel(config.GEMINI_FLASH)
-_pro_model = genai.GenerativeModel(config.GEMINI_PRO)
+_flash_model = None
+_pro_model = None
 
 _SYSTEM_HEB = "אתה יועץ תזונה ובריאות מקצועי. ענה תמיד בעברית."
+
+
+def _init_models():
+    global _flash_model, _pro_model
+    if _flash_model is None:
+        genai.configure(api_key=config.GEMINI_API_KEY)
+        _flash_model = genai.GenerativeModel(config.GEMINI_FLASH)
+        _pro_model = genai.GenerativeModel(config.GEMINI_PRO)
 
 
 # ---------------------------------------------------------------------------
@@ -38,19 +44,35 @@ def _load_image(image_bytes: bytes) -> Image.Image:
 
 
 def _ask_flash(prompt: str, image: Image.Image | None = None) -> str:
+    _init_models()
     parts = [prompt]
     if image:
         parts.insert(0, image)
-    resp = _flash_model.generate_content(parts)
-    return resp.text
+    try:
+        resp = _flash_model.generate_content(parts)
+        return resp.text
+    except Exception as e:
+        logger.error("Gemini Flash error: %s", e)
+        return ""
 
 
 def _ask_pro(prompt: str, image: Image.Image | None = None) -> str:
+    _init_models()
     parts = [prompt]
     if image:
         parts.insert(0, image)
-    resp = _pro_model.generate_content(parts)
-    return resp.text
+    try:
+        resp = _pro_model.generate_content(parts)
+        return resp.text
+    except Exception as e:
+        logger.error("Gemini Pro error (falling back to Flash): %s", e)
+        # Fallback to Flash if Pro fails
+        try:
+            resp = _flash_model.generate_content(parts)
+            return resp.text
+        except Exception as e2:
+            logger.error("Gemini Flash fallback also failed: %s", e2)
+            return ""
 
 
 def _parse_json(text: str, fallback: dict) -> dict:

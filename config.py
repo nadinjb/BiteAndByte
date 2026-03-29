@@ -10,8 +10,8 @@ GOOGLE_CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE", "credentials.json
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 # --- Gemini models (cost optimization) ---
-GEMINI_FLASH = "gemini-1.5-flash"   # Free-tier daily logging
-GEMINI_PRO = "gemini-1.5-pro"       # Complex reviews & blood analysis
+GEMINI_FLASH = "gemini-2.0-flash"   # Free-tier daily logging
+GEMINI_PRO = "gemini-2.5-pro-preview-05-06"  # Complex reviews & blood analysis
 
 # --- Google Sheets worksheet names ---
 WS_PROFILES = "User_Profile"
