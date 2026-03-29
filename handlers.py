@@ -8,6 +8,7 @@ import logging
 
 from telegram import Update
 from telegram.ext import ContextTypes, ConversationHandler
+from telegram.constants import ParseMode
 
 import config
 import sheets
@@ -24,16 +25,29 @@ NAME, AGE, GENDER, HEIGHT, WEIGHT = range(5)
 BLOOD_INPUT = 10
 
 
+# ---------------------------------------------------------------------------
+# Safe reply helper — falls back to plain text if Markdown fails
+# ---------------------------------------------------------------------------
+
+async def _safe_reply(message, text: str) -> None:
+    """Send with Markdown, fallback to plain text if parsing fails."""
+    try:
+        await message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    except Exception:
+        # Strip Markdown markers and send plain
+        plain = text.replace("*", "").replace("_", "")
+        await message.reply_text(plain)
+
+
 # ============================================================================
 # /start — Profile setup
 # ============================================================================
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text(
-        "👋 ברוכים הבאים ל-*BiteAndByte* — הסוכן האולטימטיבי לבריאות!\n\n"
+        "👋 ברוכים הבאים ל-BiteAndByte — הסוכן האולטימטיבי לבריאות!\n\n"
         "בוא/י נגדיר את הפרופיל שלך.\n"
         "מה השם שלך?",
-        parse_mode="Markdown",
     )
     return NAME
 
@@ -97,22 +111,21 @@ async def get_weight(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text(
         f"✅ הפרופיל נשמר!\n"
         f"👤 {d['name']}, גיל {d['age']}, {d['height_cm']}cm, {weight}kg\n\n"
-        f"📊 *הנתונים שחושבו:*\n"
+        f"📊 הנתונים שחושבו:\n"
         f"🔥 BMR: {bmr:.0f} קק\"ל | TDEE: {tdee:.0f} קק\"ל\n"
         f"📏 BMI: {bmi} ({insights.bmi_category(bmi)})\n"
         f"🎯 יעדי מאקרו יומיים:\n"
         f"   חלבון: {macros['protein_g']}g | פחמימות: {macros['carbs_g']}g | שומן: {macros['fats_g']}g\n\n"
         "פקודות:\n"
-        "/log_food — רישום ארוחה (טקסט או תמונה)\n"
-        "/log_water — רישום שתייה\n"
-        "/log_workout — רישום אימון\n"
-        "/log_scale — מדידת משקל (טקסט או תמונה)\n"
-        "/log_cycle — מחזור\n"
-        "/upload_blood — בדיקת דם (טקסט או תמונה)\n"
-        "/log_wearable — שינה וצעדים\n"
+        "/log\\_food — רישום ארוחה (טקסט או תמונה)\n"
+        "/log\\_water — רישום שתייה\n"
+        "/log\\_workout — רישום אימון\n"
+        "/log\\_scale — מדידת משקל (טקסט או תמונה)\n"
+        "/log\\_cycle — מחזור\n"
+        "/upload\\_blood — בדיקת דם (טקסט או תמונה)\n"
+        "/log\\_wearable — שינה וצעדים\n"
         "/status — סטטוס יומי\n"
         "/review — סיכום שבועי AI",
-        parse_mode="Markdown",
     )
     return ConversationHandler.END
 
@@ -130,11 +143,10 @@ async def log_food_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     args = context.args
     if not args:
         await update.message.reply_text(
-            "🍽️ *רישום אוכל*\n\n"
+            "🍽️ רישום אוכל\n\n"
             "טקסט: /log_food חזה עוף 200 גרם עם אורז\n"
             "תמונה: שלח/י תמונה עם הכיתוב 'אוכל'\n\n"
             "Gemini מזהה → Python מחשב → Gemini נותן פידבק!",
-            parse_mode="Markdown",
         )
         return
 
@@ -200,7 +212,7 @@ async def log_food_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     })
 
     msg = (
-        f"✅ *נרשם:*\n{items_text}\n"
+        f"✅ נרשם:\n{items_text}\n"
         f"📊 סה\"כ: {total['total_calories']:.0f} קק\"ל | "
         f"P {total['total_protein']:.0f}g | C {total['total_carbs']:.0f}g | "
         f"F {total['total_fats']:.0f}g\n\n"
@@ -208,7 +220,7 @@ async def log_food_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         f"🥩 חלבון: {daily_pro:.0f}g\n\n"
         f"🤖 {feedback}"
     )
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    await _safe_reply(update.message, msg)
 
 
 # ============================================================================
@@ -273,13 +285,13 @@ async def _handle_food_photo(update: Update, user_id: int, image_bytes: bytes) -
         f"  • {i['item']} ({i['grams']:.0f}g) — {i['calories']:.0f} קק\"ל"
         for i in nutrition["items"]
     )
-    await update.message.reply_text(
-        f"✅ *מהתמונה:*\n{items_text}\n\n"
+    msg = (
+        f"✅ מהתמונה:\n{items_text}\n\n"
         f"📊 סה\"כ: {nutrition['total_calories']:.0f} קק\"ל\n"
         f"📈 יומי: {daily_cal:.0f} / {tdee:.0f} קק\"ל\n\n"
-        f"🤖 {feedback}",
-        parse_mode="Markdown",
+        f"🤖 {feedback}"
     )
+    await _safe_reply(update.message, msg)
 
 
 async def _handle_blood_photo(update: Update, user_id: int, image_bytes: bytes) -> None:
@@ -296,19 +308,15 @@ async def _handle_blood_photo(update: Update, user_id: int, image_bytes: bytes) 
     await update.message.reply_text("🔢 שלב 2/3: בודק טווחים...")
     feedback = gemini_client.generate_blood_feedback(calculated)
 
-    # Show both structured data and AI feedback
     flags_text = "\n".join(calculated.get("flags", [])) or "אין חריגים"
     ok_text = "\n".join(calculated.get("ok", [])) or ""
 
-    msg = (
-        f"🩸 *בדיקת דם — {calculated.get('date', '?')}*\n\n"
-        f"*סמנים חריגים:*\n{flags_text}\n\n"
-    )
+    msg = f"🩸 בדיקת דם — {calculated.get('date', '?')}\n\nסמנים חריגים:\n{flags_text}\n\n"
     if ok_text:
-        msg += f"*תקינים:*\n{ok_text}\n\n"
-    msg += f"🤖 *ניתוח:*\n{feedback}"
+        msg += f"תקינים:\n{ok_text}\n\n"
+    msg += f"🤖 ניתוח:\n{feedback}"
 
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    await _safe_reply(update.message, msg)
 
 
 async def _handle_scale_photo(update: Update, user_id: int, image_bytes: bytes) -> None:
@@ -336,11 +344,11 @@ async def _handle_scale_photo(update: Update, user_id: int, image_bytes: bytes) 
     # STEP 3: Gemini VERBALIZES
     feedback = gemini_client.generate_scale_feedback(calculated)
 
-    await update.message.reply_text(
-        f"✅ *נרשם:* {weight}kg | BMI {calculated['bmi']} ({calculated['bmi_category']})\n\n"
-        f"🤖 {feedback}",
-        parse_mode="Markdown",
+    msg = (
+        f"✅ נרשם: {weight}kg | BMI {calculated['bmi']} ({calculated['bmi_category']})\n\n"
+        f"🤖 {feedback}"
     )
+    await _safe_reply(update.message, msg)
 
 
 # ============================================================================
@@ -422,7 +430,7 @@ async def log_workout_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     feedback = gemini_client.generate_workout_feedback(calculated)
 
     msg = (
-        f"✅ *אימון נרשם:* {exercise_type}, {duration} דקות, עצימות {intensity}/10\n\n"
+        f"✅ אימון נרשם: {exercise_type}, {duration} דקות, עצימות {intensity}/10\n\n"
         f"🔥 קלוריות: {calculated['calories_burned']} קק\"ל\n"
         f"📊 TDEE מעודכן: {calculated['updated_tdee']:.0f} קק\"ל\n"
         f"💧 מים נוספים: +{calculated['extra_water_l']}L\n"
@@ -431,7 +439,7 @@ async def log_workout_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         msg += f"🥩 חלבון נוסף: +{calculated['protein_bump_g']}g\n"
     msg += f"\n🤖 {feedback}"
 
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    await _safe_reply(update.message, msg)
 
 
 # ============================================================================
@@ -463,12 +471,12 @@ async def log_scale_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     # STEP 3: Gemini VERBALIZES
     feedback = gemini_client.generate_scale_feedback(calculated)
 
-    await update.message.reply_text(
-        f"✅ *נרשם:* {weight}kg | שומן {fat}% | שריר {muscle}kg\n"
+    msg = (
+        f"✅ נרשם: {weight}kg | שומן {fat}% | שריר {muscle}kg\n"
         f"📏 BMI: {calculated['bmi']} ({calculated['bmi_category']})\n\n"
-        f"🤖 {feedback}",
-        parse_mode="Markdown",
+        f"🤖 {feedback}"
     )
+    await _safe_reply(update.message, msg)
 
 
 # ============================================================================
@@ -505,8 +513,8 @@ async def log_cycle_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     feedback = gemini_client.generate_cycle_feedback(calculated)
 
     msg = (
-        f"✅ שלב מחזור: *{phase}*\n\n"
-        f"📊 *התאמות מחושבות:*\n"
+        f"✅ שלב מחזור: {phase}\n\n"
+        f"📊 התאמות מחושבות:\n"
         f"🔥 קלוריות: {adjustments['calorie_adjustment']:+d} קק\"ל\n"
         f"💧 מים נוספים: +{adjustments['water_adjustment_l']}L\n"
         f"🏋️ עצימות מומלצת: {adjustments['recommended_intensity']}\n"
@@ -514,7 +522,7 @@ async def log_cycle_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         f"🩸 {adjustments['iron_note']}\n\n"
         f"🤖 {feedback}"
     )
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    await _safe_reply(update.message, msg)
 
 
 # ============================================================================
@@ -542,11 +550,10 @@ async def upload_blood_command(update: Update, context: ContextTypes.DEFAULT_TYP
     context.user_data["blood_idx"] = 0
     _, marker_heb = BLOOD_MARKERS[0]
     await update.message.reply_text(
-        "🩸 *הזנת בדיקת דם*\n\n"
+        "🩸 הזנת בדיקת דם\n\n"
         "💡 אפשר גם לשלוח צילום מסך עם הכיתוב 'דם'\n\n"
         "הזן/י ערך, 'דלג' לדילוג, 'סיום' לסיום מוקדם.\n\n"
         f"📌 {marker_heb}:",
-        parse_mode="Markdown",
     )
     return BLOOD_INPUT
 
@@ -589,8 +596,8 @@ async def _save_blood_manual(update: Update, context: ContextTypes.DEFAULT_TYPE,
     feedback = gemini_client.generate_blood_feedback(calculated)
 
     flags_text = "\n".join(calculated.get("flags", [])) or "🎉 הכל תקין!"
-    msg = f"🩸 *בדיקת דם נשמרה*\n\n{flags_text}\n\n🤖 *ניתוח:*\n{feedback}"
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    msg = f"🩸 בדיקת דם נשמרה\n\n{flags_text}\n\n🤖 ניתוח:\n{feedback}"
+    await _safe_reply(update.message, msg)
     return ConversationHandler.END
 
 
@@ -600,7 +607,7 @@ async def _save_blood_manual(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
 async def log_wearable_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     usage = (
-        "שימוש: /log_wearable <צעדים> <שעות_שינה> <איכות>\n"
+        "שימוש: /log_wearable <צעדים> <שעות שינה> <איכות>\n"
         "איכות: good, fair, poor\n"
         "דוגמה: /log_wearable 8500 7.5 good"
     )
@@ -631,14 +638,14 @@ async def log_wearable_command(update: Update, context: ContextTypes.DEFAULT_TYP
     feedback = gemini_client.generate_wearable_feedback(calculated)
 
     msg = (
-        f"✅ *נרשם:* {steps} צעדים | {sleep_hours}h שינה ({sleep_quality})\n\n"
-        f"📊 *מחושב:*\n"
+        f"✅ נרשם: {steps} צעדים | {sleep_hours}h שינה ({sleep_quality})\n\n"
+        f"📊 מחושב:\n"
         f"😴 גירעון שינה: {calculated['sleep_deficit']}h\n"
         f"🏋️ עצימות מומלצת: {calculated['recommended_intensity']}\n"
         f"🔥 התאמת קלוריות: {calculated['calorie_adjustment']:+d} קק\"ל\n\n"
         f"🤖 {feedback}"
     )
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    await _safe_reply(update.message, msg)
 
 
 # ============================================================================
@@ -657,7 +664,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     tip = gemini_client.generate_status_feedback(calculated)
 
     msg = (
-        f"📊 *סטטוס יומי — {calculated['date']}*\n"
+        f"📊 סטטוס יומי — {calculated['date']}\n"
         f"👤 {calculated['name']}\n\n"
         f"🔥 BMR: {calculated['bmr']:.0f} | TDEE: {calculated['tdee']:.0f} קק\"ל\n"
         f"🍽️ קלוריות: {calculated['total_cal']:.0f} / {calculated['tdee']:.0f} "
@@ -669,7 +676,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"🔄 מחזור: {calculated['cycle_note']}\n\n"
         f"💡 {tip}"
     )
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    await _safe_reply(update.message, msg)
 
 
 # ============================================================================
@@ -694,4 +701,4 @@ async def review_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # STEP 3: Gemini Pro VERBALIZES
     review = gemini_client.generate_weekly_review(calculated)
 
-    await update.message.reply_text(review, parse_mode="Markdown")
+    await _safe_reply(update.message, review)
