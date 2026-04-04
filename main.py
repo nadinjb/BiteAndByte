@@ -8,8 +8,10 @@ All math is done in Python (insights.py). Gemini NEVER does math.
 
 import asyncio
 import logging
+import re
 
 from telegram import Update
+from telegram.error import BadRequest as TgBadRequest
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -24,6 +26,7 @@ import config
 import sheets_handler as sheets
 import insights
 import gemini_client
+import nutrition_db
 import reddit_research
 
 logging.basicConfig(
@@ -265,6 +268,47 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # /log_food — 3-step: Gemini extracts → Python calculates → Gemini verbalizes
 # ============================================================================
 
+# Matches an explicit quantity in a food description, e.g. "300 מל", "200g", "1.5 ליטר"
+_QUANTITY_RE = re.compile(
+    r'\b(\d+\.?\d*)\s*'
+    r'(גרם|g|מל|מ"ל|ml|cc|ליטר|l|ק"ג|kg)\b',
+    re.IGNORECASE | re.UNICODE,
+)
+
+
+def _try_quick_parse(description: str, user_id: int) -> list[dict] | None:
+    """Attempt to resolve a food description using only the local DB.
+
+    Returns a minimal Gemini-compatible item list when confident, so the
+    caller can skip the extract_food_from_text Gemini call entirely.
+
+    Conditions for skipping Gemini:
+    - Exactly one numeric quantity present (e.g. "300 גרם", "200ml")
+    - The food name (description minus quantity) hits the local nutrition_db
+      OR the fuzzy sheets lookup at ≥ 85% confidence
+
+    Falls back to None for multi-item descriptions, ambiguous units (scoops),
+    or when the item is not found locally — Gemini handles those.
+    """
+    quantities = _QUANTITY_RE.findall(description)
+    if len(quantities) != 1:
+        return None  # 0 or multiple quantities — too ambiguous
+
+    grams = float(quantities[0][0])
+    # Strip the quantity token from the description to isolate the food name
+    food_name = _QUANTITY_RE.sub("", description).strip(" ,./–-")
+    if not food_name:
+        return None
+
+    if nutrition_db.lookup(food_name) is not None:
+        return [{"item": food_name, "grams": grams}]
+
+    fuzzy = sheets.find_food_fuzzy(food_name, user_id=user_id, threshold=85)
+    if fuzzy:
+        return [{"item": food_name, "grams": grams}]
+
+    return None
+
 async def log_food_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     args = context.args
     if not args:
@@ -300,11 +344,14 @@ async def _process_food_text(
         await update.message.reply_text("🔎 מחפש במילון שלי ומנתח...")
 
     try:
-        # Check Food_Cache for known items
-        cached_items = sheets.lookup_food_cache(user_id, description)
-
-        # STEP 1: Gemini EXTRACTS items + grams (with cache context + explicit data rules)
-        extracted = gemini_client.extract_food_from_text(description, cached_items=cached_items)
+        # STEP 1: Try local DB first — skips Gemini entirely when confident.
+        # Falls back to Gemini for multi-item, ambiguous, or unknown descriptions.
+        extracted = _try_quick_parse(description, user_id)
+        if extracted is None:
+            cached_items = sheets.lookup_food_cache(user_id, description)
+            extracted = gemini_client.extract_food_from_text(
+                description, cached_items=cached_items,
+            )
 
         if not extracted or not isinstance(extracted, list):
             await update.message.reply_text(
@@ -1258,10 +1305,29 @@ async def _process_correction_nlp(
 # Free-text handler — Context Injection (catch-all, must be registered LAST)
 # ============================================================================
 
+def _is_not_modified(exc: Exception) -> bool:
+    return "message is not modified" in str(exc).lower()
+
+
 async def _edit_safe(msg, text: str) -> None:
-    """Edit a message with Markdown, falling back to plain text."""
+    """Edit a message with Markdown, falling back to plain text.
+
+    Silently ignores Telegram 400 'Message is not modified' — this happens
+    when the slow-warning already set the same text, or a double-edit race.
+    """
     try:
         await msg.edit_text(text, parse_mode=ParseMode.MARKDOWN)
+    except TgBadRequest as e:
+        if _is_not_modified(e):
+            return
+        plain = text.replace("*", "").replace("_", "")
+        try:
+            await msg.edit_text(plain)
+        except TgBadRequest as e2:
+            if not _is_not_modified(e2):
+                logger.warning("edit_text failed: %s", e2)
+        except Exception:
+            pass
     except Exception:
         plain = text.replace("*", "").replace("_", "")
         try:
@@ -1287,7 +1353,7 @@ async def _slow_warning(ack_msg, delay: float = 10.0) -> None:
         await ack_msg.edit_text(
             "⏳ המערכת עמוסה מעט, אבל אני עדיין מעבד את התשובה עבורך..."
         )
-    except asyncio.CancelledError:
+    except (asyncio.CancelledError, TgBadRequest):
         pass
 
 

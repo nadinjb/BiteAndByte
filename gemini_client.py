@@ -9,17 +9,13 @@ STRICT ROLE SEPARATION:
 import io
 import json
 import logging
+import re
 
 from google import genai
 from google.genai import types
 from google.genai.errors import APIError
 from PIL import Image
-from tenacity import (
-    retry,
-    retry_if_exception,
-    stop_after_attempt,
-    wait_exponential,
-)
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_base
 
 import config
 
@@ -58,6 +54,10 @@ def _load_image(image_bytes: bytes) -> Image.Image:
     return Image.open(io.BytesIO(image_bytes))
 
 
+_RETRY_IN_RE = re.compile(r"retry in (\d+\.?\d*)\s*s", re.IGNORECASE)
+_DEFAULT_BACKOFF = 45.0
+
+
 def _is_rate_limit(exc: BaseException) -> bool:
     """Return True for 429 errors from the Gemini API."""
     if isinstance(exc, APIError) and exc.code == 429:
@@ -65,10 +65,27 @@ def _is_rate_limit(exc: BaseException) -> bool:
     return "429" in str(exc)
 
 
+def _retry_after(exc: BaseException) -> float:
+    """Parse 'Please retry in X.Xs' from the error message.
+
+    Falls back to _DEFAULT_BACKOFF (45s) when the server doesn't tell us how
+    long to wait — this is intentionally conservative to avoid burning quota.
+    """
+    m = _RETRY_IN_RE.search(str(exc))
+    return float(m.group(1)) + 1.0 if m else _DEFAULT_BACKOFF
+
+
+class _WaitFromError(wait_base):
+    """Tenacity wait strategy that reads the delay from the exception message."""
+    def __call__(self, retry_state) -> float:
+        exc = retry_state.outcome.exception()
+        return _retry_after(exc) if exc else _DEFAULT_BACKOFF
+
+
 @retry(
     retry=retry_if_exception(_is_rate_limit),
     stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=6, max=20),
+    wait=_WaitFromError(),
     reraise=True,
 )
 def _generate(client: genai.Client, model: str, contents, cfg) -> str:
