@@ -37,6 +37,8 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 NAME, AGE, GENDER, HEIGHT, WEIGHT = range(5)
+ACTIVITY_LEVEL = 7
+GOAL = 8
 FOOD_INPUT = 6
 BLOOD_INPUT = 10
 
@@ -109,38 +111,103 @@ async def get_weight(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text("⚠️ נא להזין מספר. משקל בק\"ג?")
         return WEIGHT
 
+    context.user_data["initial_weight_kg"] = weight
+    await update.message.reply_text(
+        "מה רמת הפעילות הגופנית שלך?\n\n"
+        "1 — יושבני (עבודת משרד, כמעט ללא ספורט)\n"
+        "2 — פעיל קלות (1-3 אימונים בשבוע)\n"
+        "3 — פעיל מתון (3-5 אימונים בשבוע)\n"
+        "4 — פעיל מאוד (6-7 אימונים בשבוע)\n\n"
+        "כתוב/י מספר 1-4:"
+    )
+    return ACTIVITY_LEVEL
+
+
+_ACTIVITY_LEVEL_MAP = {
+    "1": "sedentary",
+    "2": "lightly_active",
+    "3": "moderately_active",
+    "4": "very_active",
+    "sedentary": "sedentary",
+    "lightly_active": "lightly_active",
+    "moderately_active": "moderately_active",
+    "very_active": "very_active",
+}
+
+_ACTIVITY_LEVEL_HEB = {
+    "sedentary": "יושבני",
+    "lightly_active": "פעיל קלות",
+    "moderately_active": "פעיל מתון",
+    "very_active": "פעיל מאוד",
+}
+
+
+async def get_activity_level(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    raw = update.message.text.strip().lower()
+    activity = _ACTIVITY_LEVEL_MAP.get(raw)
+    if not activity:
+        await update.message.reply_text("⚠️ נא להזין מספר 1-4.")
+        return ACTIVITY_LEVEL
+
+    context.user_data["activity_level"] = activity
+    await update.message.reply_text(
+        "מה המטרה שלך?\n\n"
+        "1 — ירידה במשקל (חיסרון קלורי של 500 קק\"ל)\n"
+        "2 — שמירה על משקל\n"
+        "3 — עלייה במסה (עודף של 300 קק\"ל)\n\n"
+        "כתוב/י מספר 1-3:"
+    )
+    return GOAL
+
+
+_GOAL_MAP = {
+    "1": "cut", "cut": "cut",
+    "2": "maintain", "maintain": "maintain",
+    "3": "bulk", "bulk": "bulk",
+}
+
+_GOAL_HEB = {"cut": "ירידה במשקל", "maintain": "שמירה", "bulk": "עלייה במסה"}
+
+
+async def get_goal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    raw = update.message.text.strip().lower()
+    goal = _GOAL_MAP.get(raw)
+    if not goal:
+        await update.message.reply_text("⚠️ נא להזין מספר 1-3.")
+        return GOAL
+
     user_id = update.effective_user.id
     d = context.user_data
+    weight = d["initial_weight_kg"]
+    activity_level = d["activity_level"]
+
     sheets.save_profile(
         user_id=user_id, name=d["name"], age=d["age"], gender=d["gender"],
         height_cm=d["height_cm"], initial_weight_kg=weight,
+        activity_level=activity_level, goal=goal,
     )
 
-    bmr = insights.calculate_bmr(weight, d["height_cm"], d["age"], d["gender"])
-    tdee = insights.calculate_tdee(bmr, 0)
+    # Calculate targets using the new engine (no Gemini)
+    targets = insights.calculate_daily_targets(user_id)
     bmi = insights.calculate_bmi(weight, d["height_cm"])
-    macros = insights.calculate_macro_targets(tdee)
 
     await update.message.reply_text(
         f"✅ הפרופיל נשמר!\n"
-        f"👤 {d['name']}, גיל {d['age']}, {d['height_cm']}cm, {weight}kg\n\n"
-        f"📊 הנתונים שחושבו:\n"
-        f"🔥 BMR: {bmr:.0f} קק\"ל | TDEE: {tdee:.0f} קק\"ל\n"
-        f"📏 BMI: {bmi} ({insights.bmi_category(bmi)})\n"
-        f"🎯 יעדי מאקרו יומיים:\n"
-        f"   חלבון: {macros['protein_g']}g | פחמימות: {macros['carbs_g']}g | שומן: {macros['fats_g']}g\n\n"
-        "פקודות מהירות:\n"
-        "/food — רישום ארוחה\n"
-        "/water — שתייה\n"
-        "/workout — אימון\n"
-        "/scale — מדידת משקל\n"
-        "/cycle — מחזור\n"
-        "/blood — בדיקת דם\n"
-        "/sleep — שינה וצעדים\n"
-        "/status — סטטוס יומי\n"
-        "/review — סיכום שבועי AI\n\n"
-        "💡 /help לרשימת פקודות מלאה\n"
-        "💬 או פשוט כתוב/י הודעה ואענה לפי הנתונים שלך!",
+        f"👤 {d['name']} | גיל {d['age']} | {d['height_cm']:.0f}cm | {weight:.1f}kg\n"
+        f"🏃 פעילות: {_ACTIVITY_LEVEL_HEB[activity_level]} | "
+        f"🎯 מטרה: {_GOAL_HEB[goal]}\n\n"
+        f"📊 *יעדים יומיים מחושבים:*\n"
+        f"🔥 BMR: {targets['bmr']:.0f} קק\"ל\n"
+        f"⚡ TDEE: {targets['tdee']:.0f} קק\"ל "
+        f"(×{targets['activity_factor']} פעילות)\n"
+        f"🍽️ יעד קלורי: {targets['calories']} קק\"ל/יום\n"
+        f"🥩 חלבון: {targets['protein_g']}g "
+        f"({targets['protein_per_kg']}g/kg)\n"
+        f"🍚 פחמימות: {targets['carbs_g']}g | "
+        f"🥑 שומן: {targets['fats_g']}g\n"
+        f"📏 BMI: {bmi} ({insights.bmi_category(bmi)})\n\n"
+        "💬 *פשוט כתוב/י לי בשפה רגילה!*\n"
+        "/help לכל היכולות",
     )
     return ConversationHandler.END
 
@@ -155,32 +222,38 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 # ============================================================================
 
 HELP_TEXT = (
-    "📋 *פקודות BiteAndByte*\n\n"
-    "🍽️ *תזונה*\n"
-    "/food — רישום ארוחה (טקסט או תמונה)\n"
-    "/fix — תיקון רישום אחרון (calories/protein/carbs/fats)\n"
-    "/correct — שמירת פריט ל-Cache לזיהוי עתידי\n\n"
+    "🤖 *BiteAndByte — הסוכן החכם שלך לבריאות*\n\n"
+    "פשוט כתוב/י בעברית — אני מבין הכל! 💬\n\n"
+    "🍽️ *אוכל ושתייה*\n"
+    "• \"אכלתי חזה עוף 200 גרם עם אורז\"\n"
+    "• \"שתיתי שייק חלבון\"\n"
+    "• שלח/י תמונה של הצלחת\n\n"
+    "🏋️ *אימונים*\n"
+    "• \"עשיתי 45 דקות כוח, היה חזק\"\n"
+    "• \"ריצה קלה של חצי שעה\"\n\n"
     "💧 *שתייה*\n"
-    "/water <ליטרים> — רישום שתייה\n\n"
-    "🏋️ *אימון*\n"
-    "/workout <סוג> <דקות> <עצימות 1-10>\n"
-    "   סוגים: functional, strength, cardio\n\n"
+    "• \"שתיתי שתי כוסות מים\"\n"
+    "• \"1.5 ליטר מים\"\n\n"
     "⚖️ *מדידות*\n"
-    "/scale <משקל> <שומן%> <מים%> <עצם> <שריר>\n"
-    "/blood — הזנת בדיקת דם (שלב אחר שלב)\n\n"
-    "😴 *שינה וצעדים*\n"
-    "/sleep <צעדים> <שעות שינה> <good/fair/poor>\n\n"
+    "• \"שקלתי 74.3 ק\"ג\"\n"
+    "• שלח/י תמונת מסך מהמשקל\n\n"
     "🔄 *מחזור*\n"
-    "/cycle <שלב> [הערות]\n"
-    "   שלבים: follicular, ovulation, luteal, menstrual\n\n"
-    "📊 *דוחות*\n"
+    "• \"התחלתי שלב לוטאלי\"\n"
+    "• \"יש לי ביוץ היום\"\n\n"
+    "😴 *שינה*\n"
+    "• \"ישנתי 7 שעות, שינה טובה, 8000 צעדים\"\n\n"
+    "✏️ *תיקונים*\n"
+    "• \"תתקן את חלב השקדים ל-39 קלוריות\"\n"
+    "• \"זה היה 13 קל ולא 126, ל-300 מ\"ל\"\n\n"
+    "📊 *דוחות ומחקר*\n"
     "/status — סטטוס יומי\n"
-    "/review — סיכום שבועי AI\n"
-    "/research <נושא> — מחקר רדיט + ניתוח אישי\n\n"
-    "📸 *תמונות*\n"
-    "שלח/י תמונה עם כיתוב: אוכל / דם / משקל\n\n"
-    "💬 *שיחה חופשית*\n"
-    "שלח/י כל הודעה ואקבל תשובה מבוססת על הנתונים שלך"
+    "/review — סיכום שבועי\n"
+    "/research <נושא> — מחקר Reddit + ניתוח אישי\n"
+    "/blood — הזנת בדיקת דם\n\n"
+    "❓ *שאלות*\n"
+    "• \"למה אני עייפה?\"\n"
+    "• \"כמה חלבון יש לי היום?\"\n"
+    "• \"מה כדאי לאכול לארוחת ערב?\""
 )
 
 
@@ -215,9 +288,16 @@ async def food_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return ConversationHandler.END
 
 
-async def _process_food_text(update: Update, description: str) -> None:
+async def _process_food_text(
+    update: Update, description: str, ack_msg=None,
+) -> None:
+    """3-step food pipeline: Gemini extracts → Python calculates → Gemini verbalizes.
+
+    ack_msg: if provided (from unified NLP handler), edit it instead of sending a new one.
+    """
     user_id = update.effective_user.id
-    await update.message.reply_text("🔍 מזהה פריטי מזון...")
+    if ack_msg is None:
+        await update.message.reply_text("🔎 מחפש במילון שלי ומנתח...")
 
     try:
         # Check Food_Cache for known items
@@ -261,8 +341,11 @@ async def _process_food_text(update: Update, description: str) -> None:
         for item in nutrition["items"]:
             if item.get("explicit"):
                 src = "📌 מדויק"
-            elif item.get("from_cache"):
+            elif item.get("source") == "cache":
                 src = "📦 Cache"
+            elif item.get("source") == "library":
+                score = item.get("match_score", 0)
+                src = f"📚 ספרייה ({score}%)"
             elif item.get("from_db"):
                 src = "📗 DB"
             else:
@@ -309,6 +392,11 @@ async def _process_food_text(update: Update, description: str) -> None:
         )
         if feedback:
             msg += f"\n\n🤖 {feedback}"
+        if nutrition.get("has_suspicious_estimates"):
+            msg += (
+                "\n\n⚠️ זה נראה לי קצת גבוה — הערכתי כי הפריט לא נמצא במילון שלי. "
+                "אם הערכים שגויים, פשוט אמור/י לי: \"תתקן את X ל-Y קלוריות\" ואעדכן הכל."
+            )
         await _safe_reply(update.message, msg)
 
     except Exception:
@@ -767,21 +855,18 @@ async def review_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 # ============================================================================
 
 async def fix_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    usage = (
-        "שימוש: /fix <שדה> <ערך>\n"
-        "שדות: calories, protein, carbs, fats\n"
-        "דוגמה: /fix protein 25\n\n"
-        "מעדכן את הרישום האחרון בלבד."
-    )
     args = context.args
     if not args or len(args) < 2:
-        await update.message.reply_text(usage)
+        await update.message.reply_text(
+            "איזה שדה תרצה/י לתקן ברישום האחרון?\n"
+            "למשל: /fix calories 39  או  /fix protein 25"
+        )
         return
 
     field = args[0].lower()
     if field not in ("calories", "protein", "carbs", "fats"):
         await update.message.reply_text(
-            f"⚠️ שדה לא מוכר: {field}\n"
+            f"לא הכרתי את השדה \"{field}\".\n"
             "אפשרויות: calories, protein, carbs, fats"
         )
         return
@@ -796,14 +881,14 @@ async def fix_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     updated = sheets.fix_last_food_entry(user_id, field, value)
 
     if not updated:
-        await update.message.reply_text("⚠️ לא נמצא רישום אוכל לעדכון.")
+        await update.message.reply_text("לא מצאתי רישום אוכל לעדכון — נסה/י לרשום ארוחה קודם.")
         return
 
     heb_field = {"calories": "קלוריות", "protein": "חלבון", "carbs": "פחמימות", "fats": "שומן"}
+    item_name = updated.get("item", "?")
     await update.message.reply_text(
-        f"✅ עודכן! הרישום האחרון ({updated.get('item', '?')}):\n"
-        f"   {heb_field[field]}: {value}\n\n"
-        f"💡 כדי לשמור את הפריט לזיהוי עתידי, השתמש/י ב-/correct"
+        f"✅ עודכן! {item_name} — {heb_field[field]}: {value:.0f}\n\n"
+        f"💡 רוצה שאזכור את הערכים לפעם הבאה? פשוט כתוב/י לי את הפרטים המלאים."
     )
 
 
@@ -812,14 +897,13 @@ async def fix_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 # ============================================================================
 
 async def correct_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    usage = (
-        "שימוש: /correct <שם פריט> <גרמים> <קלוריות> <חלבון> <פחמימות> <שומן>\n"
-        "דוגמה: /correct מולר 200 160 25 12 2\n\n"
-        "הפריט יישמר ויזוהה אוטומטית בפעם הבאה."
-    )
     args = context.args
     if not args or len(args) < 6:
-        await update.message.reply_text(usage)
+        await update.message.reply_text(
+            "אפשר גם לכתוב לי בשפה חופשית — לדוגמה:\n"
+            "\"תתקן חלב שקדים 300 מ\"ל — 39 קל, 1.2 חלבון, 1.5 פחמ, 3.3 שומן\"\n\n"
+            "או בפורמט מהיר: /correct <שם> <גרמים> <קל> <חלבון> <פחמ> <שומן>"
+        )
         return
 
     item_name = args[0]
@@ -830,17 +914,38 @@ async def correct_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         carbs = float(args[4])
         fats = float(args[5])
     except ValueError:
-        await update.message.reply_text("⚠️ כל הערכים חייבים להיות מספרים.\n" + usage)
+        await update.message.reply_text("⚠️ כל הערכים חייבים להיות מספרים.")
         return
 
     user_id = update.effective_user.id
+
+    # Save to user's personal Food_Cache (per-serving)
     sheets.save_food_cache(user_id, item_name, grams, calories, protein, carbs, fats)
 
+    # Save to global Food_Library (per-100g) so all users benefit
+    if grams > 0:
+        factor = 100.0 / grams
+        sheets.save_to_library(
+            item_name,
+            round(calories * factor, 1),
+            round(protein * factor, 1),
+            round(carbs * factor, 1),
+            round(fats * factor, 1),
+        )
+
+    # Update last Food_Log entry with the corrected values
+    sheets.update_last_log(user_id, {
+        "calories": calories,
+        "protein": protein,
+        "carbs": carbs,
+        "fats": fats,
+    })
+
     await update.message.reply_text(
-        f"✅ נשמר ל-Food Cache!\n\n"
-        f"📦 {item_name} ({grams:.0f}g):\n"
-        f"   🔥 {calories:.0f} קק\"ל | P {protein:.0f}g | C {carbs:.0f}g | F {fats:.0f}g\n\n"
-        f"בפעם הבאה שתכתוב/י '{item_name}' — הערכים ייטענו אוטומטית."
+        f"הבנתי! ✅ עדכנתי את הלוג וגם שמרתי לעצמי במילון "
+        f"ש\"{item_name}\" זה {calories:.0f} קלוריות ל-{grams:.0f}g. לא אשאל שוב.\n\n"
+        f"📚 {item_name} ({grams:.0f}g):\n"
+        f"   🔥 {calories:.0f} קק\"ל | P {protein:.0f}g | C {carbs:.0f}g | F {fats:.0f}g"
     )
 
 
@@ -923,6 +1028,233 @@ async def research_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 # ============================================================================
+# NLP dispatch helpers — called by unified free_text_handler
+# ============================================================================
+
+async def _process_workout_nlp(
+    update: Update, data: dict, ack_msg,
+) -> None:
+    exercise_type = str(data.get("type") or "functional").lower()
+    if exercise_type not in config.CALORIE_RATES:
+        exercise_type = "functional"
+    try:
+        duration = int(data.get("duration_min") or 0)
+        intensity = max(1, min(10, int(data.get("intensity") or 6)))
+    except (TypeError, ValueError):
+        duration, intensity = 0, 6
+
+    if duration <= 0:
+        await ack_msg.edit_text("כמה דקות נמשך האימון?")
+        return
+
+    user_id = update.effective_user.id
+    calculated = insights.calculate_workout_data(user_id, exercise_type, duration, intensity)
+    feedback = gemini_client.generate_workout_feedback(calculated)
+
+    msg = (
+        f"✅ אימון נרשם: {exercise_type}, {duration} דקות, עצימות {intensity}/10\n"
+        f"🔥 {calculated['calories_burned']} קק\"ל | 💧 +{calculated['extra_water_l']}L מים"
+    )
+    if calculated.get("protein_bump_g", 0) > 0:
+        msg += f" | 🥩 +{calculated['protein_bump_g']}g חלבון"
+    if feedback:
+        msg += f"\n\n🤖 {feedback}"
+    await _edit_safe(ack_msg, msg)
+
+
+async def _process_water_nlp(
+    update: Update, data: dict, ack_msg,
+) -> None:
+    try:
+        liters = float(data.get("liters") or 0)
+    except (TypeError, ValueError):
+        liters = 0.0
+
+    if liters <= 0:
+        await ack_msg.edit_text("כמה שתית? (למשל: כוס מים, 500 מ\"ל, ליטר)")
+        return
+
+    user_id = update.effective_user.id
+    sheets.log_hydration(user_id, liters)
+    goal = insights.calculate_hydration_target(
+        exercise_entries=sheets.get_exercise(user_id, days=1)
+    )
+    consumed = sum(float(r.get("liters", 0)) for r in sheets.get_hydration(user_id, days=1))
+    remaining = max(0.0, goal - consumed)
+    pct = round(consumed / max(goal, 0.1) * 100)
+
+    if remaining <= 0:
+        status = f"💧 שתית {consumed:.1f}L — עמדת ביעד ({goal:.1f}L)! 🎉"
+    else:
+        status = f"💧 {consumed:.1f} / {goal:.1f}L ({pct}%) — נשאר {remaining:.1f}L"
+
+    await ack_msg.edit_text(f"✅ נרשמו {liters:.2g}L מים.\n\n{status}")
+
+
+async def _process_scale_nlp(
+    update: Update, data: dict, ack_msg,
+) -> None:
+    try:
+        weight = float(data.get("weight_kg") or 0)
+    except (TypeError, ValueError):
+        weight = 0.0
+
+    if weight <= 0:
+        await ack_msg.edit_text("כמה שקלת? (למשל: 74.3 ק\"ג)")
+        return
+
+    def _f(key):
+        try:
+            return float(data.get(key) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    user_id = update.effective_user.id
+    calculated = insights.calculate_scale_data(
+        user_id, weight, _f("body_fat_pct"), _f("water_pct"),
+        _f("bone_mass_kg"), _f("muscle_mass_kg"),
+    )
+    feedback = gemini_client.generate_scale_feedback(calculated)
+    msg = (
+        f"✅ נרשם: {weight}kg | BMI {calculated['bmi']} ({calculated['bmi_category']})\n\n"
+        f"🤖 {feedback}"
+    )
+    await _edit_safe(ack_msg, msg)
+
+
+async def _process_cycle_nlp(
+    update: Update, data: dict, ack_msg,
+) -> None:
+    phase = str(data.get("phase") or "").lower()
+    if phase not in config.CYCLE_PHASES:
+        await ack_msg.edit_text(
+            "באיזה שלב את? זקיק / ביוץ / לוטאלי / מחזור"
+        )
+        return
+
+    notes = str(data.get("notes") or "")
+    user_id = update.effective_user.id
+    sheets.log_cycle(user_id, phase, notes)
+    adjustments = insights.get_cycle_adjustments(phase)
+    feedback = gemini_client.generate_cycle_feedback({"phase": phase, **adjustments})
+    msg = (
+        f"✅ שלב מחזור: {phase}\n"
+        f"🔥 {adjustments['calorie_adjustment']:+d} קק\"ל | 💧 +{adjustments['water_adjustment_l']}L\n\n"
+        f"🤖 {feedback}"
+    )
+    await _edit_safe(ack_msg, msg)
+
+
+async def _process_sleep_nlp(
+    update: Update, data: dict, ack_msg,
+) -> None:
+    def _i(key, default=0):
+        try:
+            return int(data.get(key) or default)
+        except (TypeError, ValueError):
+            return default
+
+    def _f(key, default=0.0):
+        try:
+            return float(data.get(key) or default)
+        except (TypeError, ValueError):
+            return default
+
+    steps = _i("steps")
+    sleep_hours = _f("sleep_hours")
+    quality = str(data.get("sleep_quality") or "fair").lower()
+    if quality not in ("good", "fair", "poor"):
+        quality = "fair"
+
+    if sleep_hours <= 0 and steps <= 0:
+        await ack_msg.edit_text("כמה שעות ישנת? (למשל: 7 שעות, שינה טובה)")
+        return
+
+    user_id = update.effective_user.id
+    sheets.log_wearable(user_id, steps, sleep_hours, quality)
+    calculated = insights.calculate_wearable_insights(sleep_hours, quality, steps)
+    feedback = gemini_client.generate_wearable_feedback(calculated)
+    msg = (
+        f"✅ נרשם: {steps:,} צעדים | {sleep_hours:.1f}h שינה ({quality})\n\n"
+        f"🤖 {feedback}"
+    )
+    await _edit_safe(ack_msg, msg)
+
+
+async def _process_correction_nlp(
+    update: Update, data: dict, ack_msg,
+) -> None:
+    user_id = update.effective_user.id
+    item = str(data.get("item") or "")
+
+    def _val(key):
+        v = data.get(key)
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    calories = _val("calories")
+    protein_g = _val("protein_g")
+    carbs_g = _val("carbs_g")
+    fats_g = _val("fats_g")
+    grams = _val("grams")
+
+    updates: dict = {}
+    if calories is not None:
+        updates["calories"] = calories
+    if protein_g is not None:
+        updates["protein"] = protein_g
+    if carbs_g is not None:
+        updates["carbs"] = carbs_g
+    if fats_g is not None:
+        updates["fats"] = fats_g
+
+    if not updates:
+        await ack_msg.edit_text(
+            "לא הצלחתי לחלץ ערכים לתיקון.\n"
+            "נסה/י: \"תתקן חלב שקדים 300 מ\"ל — 39 קל, 1.2 חלבון\""
+        )
+        return
+
+    updated = sheets.update_last_log(user_id, updates)
+
+    # Save to Food_Library only if we have full nutritional profile + grams
+    saved_to_library = False
+    if (grams and grams > 0 and
+            calories is not None and protein_g is not None and
+            carbs_g is not None and fats_g is not None):
+        factor = 100.0 / grams
+        sheets.save_food_cache(user_id, item, grams, calories, protein_g, carbs_g, fats_g)
+        sheets.save_to_library(
+            item,
+            round(calories * factor, 1),
+            round(protein_g * factor, 1),
+            round(carbs_g * factor, 1),
+            round(fats_g * factor, 1),
+        )
+        saved_to_library = True
+
+    if saved_to_library:
+        msg = (
+            f"הבנתי! ✅ עדכנתי את הלוג וגם שמרתי לעצמי במילון "
+            f"ש\"{item}\" זה {calories:.0f} קלוריות ל-{grams:.0f}g. לא אשאל שוב."
+        )
+    else:
+        fields_heb = {
+            "calories": "קלוריות", "protein": "חלבון",
+            "carbs": "פחמימות", "fats": "שומן",
+        }
+        update_str = " | ".join(
+            f"{fields_heb.get(k, k)}: {v:.0f}" for k, v in updates.items()
+        )
+        item_name = (updated.get("item", "") if updated else "") or item or "הרישום האחרון"
+        msg = f"✅ עודכן {item_name}:\n{update_str}"
+
+    await ack_msg.edit_text(msg)
+
+
+# ============================================================================
 # Free-text handler — Context Injection (catch-all, must be registered LAST)
 # ============================================================================
 
@@ -960,40 +1292,108 @@ async def _slow_warning(ack_msg, delay: float = 10.0) -> None:
 
 
 async def free_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle any non-command text by answering with full 14-day context."""
+    """Unified NLP handler — classifies intent, dispatches to the right action."""
     user_id = update.effective_user.id
-    question = update.message.text.strip()
+    text = update.message.text.strip()
 
     profile = sheets.get_profile(user_id)
     if not profile:
-        await update.message.reply_text("⚠️ לא נמצא פרופיל. הפעל/י /start כדי להתחיל.")
+        await update.message.reply_text(
+            "👋 היי! נראה שזו פעם ראשונה שלנו.\nהפעל/י /start כדי להגדיר את הפרופיל שלך."
+        )
         return
 
-    # 1. Immediate ACK
-    ack_msg = await update.message.reply_text(
-        "🔎 אני עובר על הנתונים שלך בטבלה ומנתח את המצב, רק רגע..."
-    )
+    # Merge with pending follow-up context (e.g. user answered "45 דקות")
+    pending = context.user_data.pop("pending_nlp", None)
+    if pending:
+        text = pending.get("original_text", "") + ". " + text
 
-    # 2. Typing indicator + slow-response warning (run in background)
+    # 1. Immediate ACK
+    ack_msg = await update.message.reply_text("🔎 מחפש במילון שלי ומנתח...")
+
+    # 2. Typing + slow-warning tasks
     typing_task = asyncio.create_task(
         _typing_loop(update.effective_chat.id, context.bot)
     )
     warning_task = asyncio.create_task(_slow_warning(ack_msg))
 
     try:
-        user_context = insights.build_user_context(user_id)
-        answer = gemini_client.answer_with_context(question, user_context)
-    except Exception:
-        logger.exception("Context answering failed")
+        # 3. Classify intent (fast — Gemini Flash, no user_context)
+        intent_result = gemini_client.classify_intent(text)
+        intent = intent_result.get("intent", "answer_question")
+        data = intent_result.get("data", {})
+        missing = intent_result.get("missing_fields", [])
+        follow_up = intent_result.get("follow_up")
+
         typing_task.cancel()
         warning_task.cancel()
-        await ack_msg.edit_text("⚠️ לא הצלחתי לעבד את ההודעה. נסה/י שוב.")
-        return
 
-    # 3. Cancel background tasks and edit ACK with the real answer
-    typing_task.cancel()
-    warning_task.cancel()
-    await _edit_safe(ack_msg, answer)
+        # 4. If required fields are missing, ask a natural follow-up question
+        if missing and follow_up:
+            context.user_data["pending_nlp"] = {**intent_result, "original_text": text}
+            await ack_msg.edit_text(follow_up)
+            return
+
+        # 5. Dispatch to the appropriate action
+        if intent == "log_food":
+            description = data.get("description") or text
+            await ack_msg.edit_text("🔍 מזהה פריטי מזון ומחשב...")
+            await _process_food_text(update, description, ack_msg=ack_msg)
+
+        elif intent == "log_workout":
+            await _process_workout_nlp(update, data, ack_msg)
+
+        elif intent == "log_water":
+            await _process_water_nlp(update, data, ack_msg)
+
+        elif intent == "log_scale":
+            await _process_scale_nlp(update, data, ack_msg)
+
+        elif intent == "log_cycle":
+            await _process_cycle_nlp(update, data, ack_msg)
+
+        elif intent == "log_sleep":
+            await _process_sleep_nlp(update, data, ack_msg)
+
+        elif intent == "correct_food":
+            await _process_correction_nlp(update, data, ack_msg)
+
+        elif intent == "status":
+            calculated = insights.calculate_daily_status(user_id)
+            if not calculated:
+                await ack_msg.edit_text("⚠️ לא נמצא פרופיל. הפעל/י /start")
+                return
+            tip = gemini_client.generate_status_feedback(calculated)
+            msg = (
+                f"📊 סטטוס יומי — {calculated['date']}\n"
+                f"🔥 קלוריות: {calculated['total_cal']:.0f} / {calculated['tdee']:.0f} "
+                f"(נותרו {calculated['remaining_cal']})\n"
+                f"🥩 {calculated['protein_status']}\n"
+                f"💧 שתייה: {calculated['hydration_pct']}%\n\n"
+                f"💡 {tip}"
+            )
+            await _edit_safe(ack_msg, msg)
+
+        elif intent == "review":
+            calculated = insights.calculate_weekly_review(user_id)
+            await ack_msg.edit_text("🤖 Gemini Pro כותב סיכום...")
+            review = gemini_client.generate_weekly_review(calculated)
+            await _edit_safe(ack_msg, review)
+
+        else:
+            # answer_question — full 14-day context
+            user_context = insights.build_user_context(user_id)
+            answer = gemini_client.answer_with_context(text, user_context)
+            await _edit_safe(ack_msg, answer)
+
+    except Exception:
+        logger.exception("NLP handler failed for: %s", text)
+        typing_task.cancel()
+        warning_task.cancel()
+        try:
+            await ack_msg.edit_text("⚠️ לא הצלחתי לעבד את ההודעה. נסה/י שוב.")
+        except Exception:
+            pass
 
 
 # ============================================================================
@@ -1020,6 +1420,8 @@ def main() -> None:
             GENDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_gender)],
             HEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_height)],
             WEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_weight)],
+            ACTIVITY_LEVEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_activity_level)],
+            GOAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_goal)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )

@@ -222,26 +222,82 @@ FOODS: dict[str, tuple[float, float, float, float]] = {
     "בירה": (43, 0.5, 3.6, 0.0),
     "wine": (83, 0.1, 2.6, 0.0),
     "יין": (83, 0.1, 2.6, 0.0),
+
+    # --- Plant-based milks (per 100ml) ---
+    "almond_milk": (13, 0.4, 0.5, 1.1),
+    "חלב שקדים": (13, 0.4, 0.5, 1.1),
+    "oat_milk": (46, 1.0, 6.6, 1.5),
+    "חלב שיבולת שועל": (46, 1.0, 6.6, 1.5),
+    "soy_milk": (33, 3.3, 0.5, 1.8),
+    "חלב סויה": (33, 3.3, 0.5, 1.8),
+}
+
+
+# Brand-specific products with exact per-100g nutritional values.
+# Checked BEFORE the generic FOODS dict — takes priority over substring matches.
+BRANDS: dict[str, tuple[float, float, float, float]] = {
+    # Alpro & plant-based milks (per 100ml)
+    "alpro almond": (13, 0.4, 0.5, 1.1),
+    "alpro oat": (46, 1.0, 6.6, 1.5),
+    "alpro soy": (33, 3.3, 0.5, 1.8),
+    "alpro": (13, 0.4, 0.5, 1.1),       # default to almond if unspecified
+    "almond milk": (13, 0.4, 0.5, 1.1),
+    "oat milk": (46, 1.0, 6.6, 1.5),
+    "soy milk": (33, 3.3, 0.5, 1.8),
+    "plant milk": (13, 0.4, 0.5, 1.1),
+
+    # Muller (per 100g)
+    "muller pro": (85, 11.5, 6.7, 1.2),
+    "מולר פרו": (85, 11.5, 6.7, 1.2),
+    "muller corner": (135, 4.0, 20.0, 4.0),
+    "מולר קורנר": (135, 4.0, 20.0, 4.0),
+    "muller": (85, 11.5, 6.7, 1.2),     # default to Pro
+    "מולר": (85, 11.5, 6.7, 1.2),
+
+    # Optimum Nutrition Gold Standard Whey (per 100g powder)
+    "double rich chocolate": (390, 77.0, 9.0, 5.0),
+    "gold standard whey": (390, 77.0, 9.0, 5.0),
+    "on whey": (390, 77.0, 9.0, 5.0),
+    "optimum nutrition": (390, 77.0, 9.0, 5.0),
 }
 
 
 def lookup(food_key: str) -> tuple[float, float, float, float] | None:
     """Look up per-100g nutrition values: (cal, protein, carbs, fats).
 
-    Tries exact match first, then case-insensitive substring search.
+    Priority: BRANDS exact → BRANDS substring → FOODS exact → FOODS substring.
+    Substring matches require the db key to be at least 4 chars to avoid
+    spurious matches like "milk" inside "almond milk".
     """
     key = food_key.strip().lower()
 
-    # Exact match
+    # 1. Brand exact match
+    if key in BRANDS:
+        return BRANDS[key]
+
+    # 2. Brand substring match
+    for brand_key, values in BRANDS.items():
+        if len(brand_key) >= 4 and (brand_key in key or key in brand_key):
+            return values
+
+    # 3. FOODS exact match
     if key in FOODS:
         return FOODS[key]
 
-    # Substring match
+    # 4. FOODS substring match — require db_key >= 4 chars to avoid false positives
+    #    (e.g., "milk" must not match "almond milk")
+    best_match: tuple[float, float, float, float] | None = None
+    best_len = 0
     for db_key, values in FOODS.items():
-        if key in db_key or db_key in key:
-            return values
+        if len(db_key) < 4:
+            continue
+        if db_key in key or key in db_key:
+            # Prefer longer (more specific) match
+            if len(db_key) > best_len:
+                best_match = values
+                best_len = len(db_key)
 
-    return None
+    return best_match
 
 
 def calculate_nutrition(food_key: str, grams: float) -> dict:

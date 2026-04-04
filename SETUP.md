@@ -10,7 +10,7 @@
 4. Click **Create API Key** → select or create a Google Cloud project
 5. Copy the API key — this is your `GEMINI_API_KEY`
 
-The bot uses **Gemini 2.5 Flash** for daily logging, food extraction, context-aware chat, and Reddit research. **Gemini 2.5 Pro** is reserved for weekly reviews and blood test analysis only (auto-falls back to Flash if Pro fails).
+The bot uses **Gemini 2.5 Flash** for daily logging, food extraction, intent classification, nutrition estimation, context-aware chat, and Reddit research. **Gemini 2.5 Pro** is reserved for weekly reviews and blood test analysis only (auto-falls back to Flash if Pro fails).
 
 ### 1b. Reddit API (Free Tier — optional)
 
@@ -54,13 +54,14 @@ The `/research` command searches r/Biohacking, r/Nutrition, and r/Fitness for co
 4. **Share the spreadsheet** with the service account email
    (found in `credentials.json` → `client_email` field) — give **Editor** access
 
-The bot will auto-create all 9 worksheet tabs on first use:
+The bot will auto-create all 10 worksheet tabs on first use:
 
 | Worksheet | Columns | Purpose |
 |-----------|---------|---------|
-| `User_Profiles` | user_id, name, age, gender, height_cm, initial_weight_kg | Profile data |
+| `User_Profiles` | user_id, name, age, gender, height_cm, initial_weight_kg, activity_level, goal | Profile + fitness goal |
 | `Food_Log` | user_id, date, item, calories, protein_g, carbs_g, fats_g | Meal entries |
-| `Food_Cache` | user_id, item, grams, calories, protein_g, carbs_g, fats_g | Learned food corrections (Rule #3) |
+| `Food_Cache` | user_id, item, grams, calories, protein_g, carbs_g, fats_g | Per-user food corrections |
+| `Food_Library` | item, calories_per_100, protein_per_100, carbs_per_100, fats_per_100 | Global learned food database (per 100g) |
 | `Biometrics` | user_id, date, weight_kg, body_fat_pct, water_pct, bone_mass_kg, muscle_mass_kg | Body composition |
 | `Hydration` | user_id, date, liters | Daily water intake (cumulative) |
 | `Workouts` | user_id, date, type, duration_min, intensity, estimated_kcal | Exercise sessions |
@@ -131,28 +132,29 @@ python main.py
 | `python-dotenv` | 1.0.1 | Load `.env` variables |
 | `Pillow` | 11.1.0 | Image processing for photo analysis |
 | `praw` | 7.8.1 | Reddit API client |
+| `rapidfuzz` | >= 3.0 | Fuzzy food name matching (Food_Library & Food_Cache) |
 
 ## 5. Commands Reference
 
+The bot understands **natural language** — you don't need to memorize command syntax. Just write what you did and it figures out the intent. Commands are shortcuts, not requirements.
+
 | Short | Full | Description | Example |
 |-------|------|-------------|---------|
-| `/start` | | Profile setup (guided: name, age, gender, height, weight) | `/start` |
-| `/food` | `/log_food` | Log food — text or photo (Gemini extracts, Python calculates) | `/food חזה עוף 200 גרם עם אורז` |
-| `/water` | `/log_water` | Log water intake (cumulative per day) | `/water 0.5` |
-| `/workout` | `/log_workout` | Log exercise (type, duration, intensity 1-10) | `/workout functional 45 7` |
-| `/scale` | `/log_scale` | Log body composition (weight, fat%, water%, bone, muscle) | `/scale 75.2 18.5 55.3 3.1 35.8` |
-| `/cycle` | `/log_cycle` | Log cycle phase with optional notes | `/cycle luteal עייפות קלה` |
+| `/start` | | Profile setup — guided 7-step flow: name, age, gender, height, weight, activity level, goal | `/start` |
+| `/food` | `/log_food` | Log food — text or photo (Gemini extracts, Python calculates) | `/food` or just type "אכלתי חזה עוף ואורז" |
+| `/water` | `/log_water` | Log water intake (cumulative per day) | `/water` or "שתיתי חצי ליטר מים" |
+| `/workout` | `/log_workout` | Log exercise — natural language or command | `/workout` or "עשיתי כוח 45 דקות" |
+| `/scale` | `/log_scale` | Log body composition (weight, fat%, water%, bone, muscle) | `/scale` or "המשקל שלי 75.2" |
+| `/cycle` | `/log_cycle` | Log cycle phase with optional notes | `/cycle` or "התחלתי מחזור היום" |
 | `/blood` | `/upload_blood` | Enter blood markers step-by-step (12 markers, skip/end anytime) | `/blood` |
-| `/sleep` | `/log_wearable` | Log steps, sleep hours, sleep quality | `/sleep 8500 7.5 good` |
+| `/sleep` | `/log_wearable` | Log steps, sleep hours, sleep quality | `/sleep` or "ישנתי 7 שעות, 8500 צעדים" |
 | `/status` | | Daily snapshot (BMR, TDEE, calories, protein, hydration, sleep, cycle) | `/status` |
 | `/review` | | Weekly AI review — 7-day comprehensive summary (Gemini Pro) | `/review` |
-| `/fix` | | Fix last food entry field (calories/protein/carbs/fats) | `/fix protein 25` |
-| `/correct` | | Save corrected food item to Food Cache for future recognition | `/correct מולר 200 160 25 12 2` |
+| `/fix` | | Fix last food entry (say what was wrong in natural language) | "תקן את הקלוריות ל-300" |
+| `/correct` | | Save a food item to the global Food_Library for future recognition | "מולר פרו 100 גרם הוא 85 קלוריות ו-11 גרם חלבון" |
 | `/research` | | Reddit research + personalized AI analysis | `/research creatine` |
 | `/help` | | Show all available commands | `/help` |
 | `/cancel` | | Cancel any active conversation | `/cancel` |
-
-All `log_*` and `upload_blood` long-form commands still work alongside the short aliases.
 
 ### Photo Detection
 Send a photo with one of these captions:
@@ -161,15 +163,22 @@ Send a photo with one of these captions:
 - **"משקל"**, **"scale"**, or **"מדידה"** — Scale screenshot extraction
 - No caption — defaults to food analysis
 
-### Free-text Chat (Context Injection)
-Send any message without a command and the bot will answer based on your last **14 days** of data from all tabs (food, biometrics, hydration, exercise, sleep, cycle, blood work). The bot shows an immediate acknowledgment message and typing indicator while processing.
+### Free-text & NLP Intent Recognition
+Send any message in natural Hebrew and the bot classifies the intent automatically using Gemini Flash. No template syntax required.
 
-Examples:
-- **"בוקר טוב"** — Daily briefing: last night's sleep, cycle phase, today's goals, hydration, planned workout
-- **"למה אני עייפה?"** — Checks sleep hours/quality, iron levels, carb intake, cycle phase
-- **"מה לאכול עכשיו?"** — Plans a meal based on remaining calories and protein target
-- **"תסביר לי את בדיקות הדם"** — Explains blood results in plain Hebrew
-- **"נשאר לי 500 קלוריות ו-40 גרם חלבון"** — Suggests what to eat
+Recognized intents:
+- **log_food** — "אכלתי חזה עוף עם אורז", "שתיתי שייק חלבון"
+- **log_workout** — "עשיתי כוח 45 דקות", "רצתי 30 דקות בעצימות 7"
+- **log_water** — "שתיתי שני כוסות מים", "הוסף חצי ליטר"
+- **log_scale** — "המשקל שלי היום 74.8", "שקלתי את עצמי"
+- **log_cycle** — "התחלתי מחזור", "אני בשלב לוטאלי"
+- **log_sleep** — "ישנתי 7 שעות, שאיפות שינה טובה, 9000 צעדים"
+- **correct_food** — "תיקון: מולר פרו 100 גרם הוא 85 קלוריות"
+- **status** — "מה הסטטוס שלי?", "כמה קלוריות נשאר לי?"
+- **review** — "סיכום שבועי", "תעשה לי review"
+- **answer_question** — Any health question answered using 14-day personal context
+
+When the bot needs more information (e.g. duration or intensity for a workout), it asks a natural follow-up question in Hebrew and waits for your reply before logging.
 
 ### Reddit Research
 `/research <topic>` searches r/Biohacking, r/Nutrition, and r/Fitness for the top 10 most relevant threads from the past year. Extracts the top 5 comments per thread (min 2 upvotes, max 500 chars each). Gemini then compares the community advice to your personal data and returns a Hebrew summary:
@@ -186,34 +195,61 @@ Examples:
 ```
 Gemini extracts → Python calculates → Gemini verbalizes
 ```
-All math is done in Python (`insights.py`). Gemini never does math — it only extracts raw data and generates Hebrew verbal feedback from pre-calculated results.
+All math is done in Python (`insights.py`). Gemini never does math — it only extracts raw data, classifies intent, estimates unknowns, and generates Hebrew verbal feedback from pre-calculated results.
+
+### /start Profile Flow (7 steps)
+1. **Name** — First name for personalized messages
+2. **Age** — Used in Mifflin-St Jeor BMR formula
+3. **Gender** — Male/female for BMR constant offset
+4. **Height** — In cm
+5. **Weight** — Starting weight in kg (also sets initial biometric entry)
+6. **Activity Level** — Sedentary / Lightly active / Moderately active / Very active
+7. **Goal** — Cut (−500 kcal/day deficit) / Maintain / Bulk (+300 kcal/day surplus)
+
+After step 7, the bot calculates and displays: BMR, TDEE, daily calorie target, protein/carbs/fat grams, and BMI.
 
 ### Food Extraction Rules
 1. **Explicit Data Priority** — If the user states exact values ("25g protein", "300 calories"), those numbers are used as-is
-2. **Brand Awareness** — Gemini recognizes brand names (Muller, PRO, Danone) and defaults to the high-protein variant
-3. **Correction Learning** — Items saved via `/correct` go to `Food_Cache` and are auto-recognized next time
+2. **Brand Awareness** — Brand dictionary (Alpro, Muller PRO/Corner, ON Whey) is checked before generic foods — uses per-100g exact values
+3. **No Invented Values** — Gemini is instructed not to hallucinate nutrition data; estimates are clearly flagged
+4. **Correction Learning** — Items saved via `/correct` go to both `Food_Cache` (per-user) and `Food_Library` (global) and are auto-recognized next time
 
 ### Nutrition Lookup Priority
 When calculating nutrition for a food item, the system checks in order:
+
 1. **Explicit values** — User-provided numbers from the message
-2. **Food Cache** — Previously corrected items per user (`Food_Cache` sheet)
-3. **Local DB** — Built-in database of ~225 foods with per-100g values (`nutrition_db.py`)
-4. **Generic estimate** — Fallback: 1.2 cal/g, 0.08g protein/g, 0.15g carbs/g, 0.05g fat/g
+2. **Food Cache** (fuzzy, per-user) — Previously corrected items for this user; fuzzy-matched with 85% threshold via `rapidfuzz`
+3. **Food Library** (fuzzy, global) — Crowdsourced corrections from all users; fuzzy-matched with 85% threshold
+4. **Local DB** — Built-in database of ~225 foods with per-100g values (`nutrition_db.py`); brand names checked first (Alpro, Muller, ON), then generic foods
+5. **Gemini estimate** — Conservative lower-bound estimate for completely unknown items; flagged with a warning
+6. **Hardcoded fallback** — Last resort: 0.7 kcal/g, 0.05g protein/g, 0.10g carbs/g, 0.03g fat/g
+
+If any item is estimated (steps 5–6), the bot shows: "⚠️ חלק מהערכים הם הערכה — בדוק ותקן אם נדרש."
 
 ### Calculations (insights.py)
 
-**BMR & TDEE:**
-- BMR: Mifflin-St Jeor formula (weight, height, age, gender)
-- TDEE: BMR * 1.2 + daily exercise calories (updates in real-time)
+**BMR (Mifflin-St Jeor):**
+- Male: `BMR = 10×weight + 6.25×height − 5×age + 5`
+- Female: `BMR = 10×weight + 6.25×height − 5×age − 161`
+
+**TDEE (Total Daily Energy Expenditure):**
+- `TDEE = BMR × activity_factor`
+- Activity factors: sedentary 1.200 / lightly_active 1.375 / moderately_active 1.550 / very_active 1.725
+- Logged workout calories are added on top of TDEE (not double-counted with activity factor)
+
+**Daily Calorie Target:**
+- Cut: `TDEE − 500 kcal`
+- Maintain: `TDEE`
+- Bulk: `TDEE + 300 kcal`
+
+**Macro Targets (weight-based protein):**
+- Protein: `weight_kg × rate` — cut: 2.2 g/kg, maintain: 2.0 g/kg, bulk: 1.8 g/kg
+- Remaining calories split: carbs (cut 40%, maintain 50%, bulk 55%) / fat (remainder)
+- All targets cached daily per user; invalidated automatically when new weight is logged
 
 **Body Metrics:**
 - BMI with Hebrew categories (underweight / normal / overweight / obese)
 - 30-day composition deltas (weight, fat%, muscle, water%)
-
-**Macro Targets (3 modes):**
-- Maintain: 30% protein / 40% carbs / 30% fat
-- Cut: TDEE - 300 cal, 35% protein / 35% carbs / 30% fat
-- Bulk: TDEE + 300 cal, 30% protein / 45% carbs / 25% fat
 
 **Exercise:**
 - Calorie burn rates: functional 0.9, strength 0.8, cardio 1.1 (kcal/min per intensity unit)
@@ -245,22 +281,26 @@ When calculating nutrition for a food item, the system checks in order:
 
 ### UX Features
 - **Immediate ACK** — Bot sends a temporary "analyzing..." message instantly
+- **NLP intent classification** — Every free-text message classified by Gemini Flash; dispatched to the right handler automatically
+- **Multi-turn follow-up** — If a required field is missing (e.g. duration for workout), bot asks a natural question and waits; context is preserved between turns
+- **No template syntax** — Users never see `<arg>` placeholders or rigid format requirements
 - **Typing indicator** — Shows "typing..." in Telegram while Gemini processes
 - **Slow warning** — After 10s, edits message to "still processing..."
 - **Message editing** — Final answer replaces the temp message (keeps chat clean)
 - **Error recovery** — If Gemini fails, user sees a retry prompt instead of silence
 - **Gemini retry** — Auto-retries on 429 rate limit (3 attempts, 6s/12s/18s backoff)
+- **Sheets retry** — Auto-retries on 429 rate limit (3 attempts, 5s/10s/20s backoff) with 60-second read cache
 - **Pro → Flash fallback** — If Gemini Pro fails, automatically retries with Flash
 
 ## 7. Architecture
 
 ```
-main.py             → Entry point, all Telegram handlers & bot wiring
-config.py           → Environment vars, model names, constants
-sheets_handler.py   → Google Sheets CRUD (9 auto-created worksheets)
-gemini_client.py    → Gemini 2.5 Flash/Pro API (text + vision + retry)
-insights.py         → All Python math (BMR, TDEE, macros, blood ranges, context builder)
-nutrition_db.py     → Local food database (~225 foods, per-100g values)
+main.py             → Entry point, all Telegram handlers, NLP dispatcher & bot wiring
+config.py           → Environment vars, model names, activity factors, goal deltas, macro rates
+sheets_handler.py   → Google Sheets CRUD (10 auto-created worksheets, fuzzy food lookup)
+gemini_client.py    → Gemini 2.5 Flash/Pro API (text + vision + intent classification + retry)
+insights.py         → All Python math (BMR, TDEE, macros, daily targets cache, blood ranges)
+nutrition_db.py     → Local food database (~225 foods + brand dictionary, per-100g values)
 reddit_research.py  → Reddit API via praw (search + extract top comments)
 ```
 
@@ -268,6 +308,8 @@ reddit_research.py  → Reddit API via praw (search + extract top comments)
 
 | Function | Model | Purpose |
 |----------|-------|---------|
+| `classify_intent()` | Flash | Classify free-text into structured intent + extract data fields |
+| `estimate_nutrition()` | Flash | Conservative lower-bound nutrition estimate for unknown foods |
 | `extract_food_from_text()` | Flash | Extract food items + grams from text |
 | `extract_food_from_photo()` | Flash | Extract food items from photo |
 | `extract_blood_markers()` | Pro | Extract 12 blood markers from screenshot |
@@ -285,7 +327,8 @@ reddit_research.py  → Reddit API via praw (search + extract top comments)
 
 ### Cost Optimization
 - All math (BMR, TDEE, calorie burn, hydration, macros, blood ranges) calculated locally in Python
-- Food Cache checked in Google Sheets before calling Gemini
+- Daily targets cached per user+date; invalidated only on new weight log
+- Fuzzy food lookup (Food_Cache → Food_Library → local DB) checked before calling Gemini for estimates
 - Daily logging, context chat, Reddit research → **Gemini 2.5 Flash** (fast, free tier)
 - Weekly reviews & blood analysis → **Gemini 2.5 Pro** (complex, free tier)
 - Reddit comments truncated to 500 chars, max 10 threads, 5 comments each → stays within token limits

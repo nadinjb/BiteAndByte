@@ -30,6 +30,36 @@ WS_EXERCISE = "Workouts"
 WS_CYCLE = "Cycle_Data"
 WS_BLOOD = "Blood_Work"
 WS_WEARABLE = "Wearable_Sync"
+WS_FOOD_LIBRARY = "Food_Library"
+
+# --- Activity level → PAL multipliers (Mifflin-St Jeor standard) ---
+ACTIVITY_FACTORS: dict[str, float] = {
+    "sedentary":         1.200,   # desk job, no exercise
+    "lightly_active":    1.375,   # 1-3 days/week
+    "moderately_active": 1.550,   # 3-5 days/week
+    "very_active":       1.725,   # 6-7 days/week
+}
+
+# --- Goal → daily caloric delta (kcal) relative to TDEE ---
+GOAL_DELTAS: dict[str, int] = {
+    "cut":      -500,
+    "maintain":    0,
+    "bulk":      300,
+}
+
+# --- Protein targets (g per kg body weight) per goal ---
+PROTEIN_RATES: dict[str, float] = {
+    "cut":      2.2,   # higher protein preserves muscle in deficit
+    "maintain": 2.0,
+    "bulk":     1.8,
+}
+
+# --- Carb share of remaining (non-protein) calories per goal ---
+CARB_SHARE: dict[str, float] = {
+    "cut":      0.40,   # lower carbs on cut
+    "maintain": 0.50,
+    "bulk":     0.55,   # higher carbs on bulk
+}
 
 # --- Exercise calorie burn (kcal per minute per intensity unit) ---
 CALORIE_RATES = {

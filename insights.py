@@ -53,20 +53,33 @@ def get_bmr_for_user(user_id: int) -> float:
 
 
 # ---------------------------------------------------------------------------
-# TDEE — BMR * activity factor + exercise
+# TDEE — BMR × activity factor + same-day logged workouts
 # ---------------------------------------------------------------------------
 
-def calculate_tdee(bmr: float, exercise_kcal_today: float) -> float:
-    """TDEE = BMR * 1.2 (sedentary base) + exercise calories."""
-    return round(bmr * 1.2 + exercise_kcal_today, 1)
+def calculate_tdee(
+    bmr: float,
+    activity_level: str = "sedentary",
+    exercise_kcal_today: float = 0,
+) -> float:
+    """TDEE = BMR × PAL factor + today's logged workout calories.
+
+    The activity factor already accounts for general lifestyle movement.
+    Logged workouts are added on top so the daily calorie budget reflects
+    actual training done (avoids under-eating on heavy training days).
+    """
+    factor = config.ACTIVITY_FACTORS.get(activity_level.lower(), 1.2)
+    return round(bmr * factor + exercise_kcal_today, 1)
 
 
 def get_tdee_for_user(user_id: int) -> float:
+    """Convenience wrapper: reads activity_level from profile, adds today's workouts."""
+    profile = sheets.get_profile(user_id)
+    activity_level = str(profile.get("activity_level", "sedentary")) if profile else "sedentary"
     bmr = get_bmr_for_user(user_id)
     exercises = sheets.get_exercise(user_id, days=1)
     ex_kcal = sum(float(e.get("estimated_kcal", 0)) for e in exercises
                   if e.get("date") == sheets.today())
-    return calculate_tdee(bmr, ex_kcal)
+    return calculate_tdee(bmr, activity_level, ex_kcal)
 
 
 # ---------------------------------------------------------------------------
@@ -136,32 +149,128 @@ def calculate_extra_water_for_workout(duration_min: int, intensity: int) -> floa
 # Macro targets
 # ---------------------------------------------------------------------------
 
-def calculate_macro_targets(tdee: float, goal: str = "maintain") -> dict:
-    """Split TDEE into macro targets (grams).
+def calculate_macro_targets(
+    tdee: float,
+    goal: str = "maintain",
+    weight_kg: float = 70,
+) -> dict:
+    """Calculate daily macro targets from TDEE, goal, and body weight.
 
-    Ratios:
-      maintain: 30% protein, 40% carbs, 30% fat
-      cut:      35% protein, 35% carbs, 30% fat (deficit of 300 kcal)
-      bulk:     30% protein, 45% carbs, 25% fat (surplus of 300 kcal)
+    Protein is set first from weight (1.8–2.2 g/kg depending on goal).
+    Remaining calories are split between carbs and fats.
+    Calorie target is TDEE ± goal delta (see config.GOAL_DELTAS).
 
-    Returns: {calories, protein_g, carbs_g, fats_g}
+    Returns: {calories, protein_g, carbs_g, fats_g, protein_per_kg}
     """
-    if goal == "cut":
-        cal = tdee - 300
-        p_pct, c_pct, f_pct = 0.35, 0.35, 0.30
-    elif goal == "bulk":
-        cal = tdee + 300
-        p_pct, c_pct, f_pct = 0.30, 0.45, 0.25
-    else:
-        cal = tdee
-        p_pct, c_pct, f_pct = 0.30, 0.40, 0.30
+    goal_key = goal.lower() if goal.lower() in config.GOAL_DELTAS else "maintain"
+
+    # 1. Calorie target
+    cal_target = round(tdee + config.GOAL_DELTAS[goal_key])
+
+    # 2. Protein: weight-based (g)
+    protein_rate = config.PROTEIN_RATES[goal_key]
+    protein_g = round(weight_kg * protein_rate)
+    protein_kcal = protein_g * 4  # 4 kcal/g
+
+    # 3. Remaining calories → carbs + fats
+    remaining = max(cal_target - protein_kcal, 0)
+    carb_share = config.CARB_SHARE[goal_key]
+    carbs_g = round(remaining * carb_share / 4)   # 4 kcal/g carbs
+    fats_g = round(remaining * (1 - carb_share) / 9)  # 9 kcal/g fat
 
     return {
-        "calories": round(cal),
-        "protein_g": round(cal * p_pct / 4),   # 4 kcal/g protein
-        "carbs_g": round(cal * c_pct / 4),      # 4 kcal/g carbs
-        "fats_g": round(cal * f_pct / 9),        # 9 kcal/g fat
+        "calories": cal_target,
+        "protein_g": protein_g,
+        "carbs_g": carbs_g,
+        "fats_g": fats_g,
+        "protein_per_kg": protein_rate,
     }
+
+
+# ---------------------------------------------------------------------------
+# calculate_daily_targets — single source of truth for calorie/macro goals
+# ---------------------------------------------------------------------------
+
+# Cache: {user_id: (date_str, targets_dict)}
+# Recalculated at most once per calendar day, or when a new weight is logged.
+_targets_cache: dict[int, tuple[str, dict]] = {}
+
+
+def calculate_daily_targets(user_id: int) -> dict:
+    """Calculate personalised daily nutrition targets. Pure Python — no Gemini.
+
+    Algorithm:
+      1. Read Age, Weight, Height, Gender, Activity Level, Goal from User_Profiles.
+         Use the most recent Biometrics entry for weight if available.
+      2. BMR (Mifflin-St Jeor):
+            Male:   10·W + 6.25·H − 5·A + 5
+            Female: 10·W + 6.25·H − 5·A − 161
+      3. TDEE = BMR × activity_factor  (from config.ACTIVITY_FACTORS)
+      4. Calorie target = TDEE + goal_delta  (from config.GOAL_DELTAS)
+      5. Protein = weight_kg × protein_rate  (1.8–2.2 g/kg from config.PROTEIN_RATES)
+      6. Remaining kcal split between carbs (config.CARB_SHARE) and fats.
+
+    Results are cached per user per calendar day and invalidated when
+    log_biometrics() is called (via invalidate_daily_targets).
+
+    Returns:
+        weight_kg, bmr, activity_level, activity_factor, tdee, goal,
+        calories, protein_g, carbs_g, fats_g, protein_per_kg
+    """
+    today = sheets.today()
+    cached_date, cached_targets = _targets_cache.get(user_id, ("", {}))
+    if cached_date == today and cached_targets:
+        return cached_targets
+
+    profile = sheets.get_profile(user_id)
+    if not profile:
+        return {}
+
+    # Current weight: latest biometrics entry or profile initial weight
+    weight = float(profile.get("initial_weight_kg") or 70)
+    bio = sheets.get_biometrics(user_id, days=60)
+    if bio:
+        weight = float(bio[-1].get("weight_kg") or weight)
+
+    height = float(profile.get("height_cm") or 170)
+    age = int(profile.get("age") or 30)
+    gender = str(profile.get("gender") or "male")
+    activity_level = str(profile.get("activity_level") or "sedentary").lower()
+    goal = str(profile.get("goal") or "maintain").lower()
+
+    # Normalise goal/activity to known keys
+    if activity_level not in config.ACTIVITY_FACTORS:
+        activity_level = "sedentary"
+    if goal not in config.GOAL_DELTAS:
+        goal = "maintain"
+
+    # 1. BMR
+    bmr = calculate_bmr(weight, height, age, gender)
+
+    # 2. TDEE (no exercise added here — workouts are added at query time)
+    factor = config.ACTIVITY_FACTORS[activity_level]
+    tdee = round(bmr * factor, 1)
+
+    # 3–6. Macro targets
+    macros = calculate_macro_targets(tdee, goal, weight)
+
+    targets = {
+        "weight_kg": weight,
+        "bmr": bmr,
+        "activity_level": activity_level,
+        "activity_factor": factor,
+        "tdee": tdee,
+        "goal": goal,
+        **macros,
+    }
+
+    _targets_cache[user_id] = (today, targets)
+    return targets
+
+
+def invalidate_daily_targets(user_id: int) -> None:
+    """Force recalculation on next call — called when a new weight is logged."""
+    _targets_cache.pop(user_id, None)
 
 
 # ---------------------------------------------------------------------------
@@ -390,47 +499,61 @@ def calculate_food_nutrition(extracted_items: list[dict], user_id: int = 0) -> d
             item_result = {
                 "item": food_name,
                 "grams": grams,
-                "calories": float(explicit_cal) if explicit_cal is not None else (db_result["calories"] if db_result else round(grams * 1.2, 1)),
-                "protein_g": float(explicit_pro) if explicit_pro is not None else (db_result["protein_g"] if db_result else round(grams * 0.08, 1)),
-                "carbs_g": float(explicit_carbs) if explicit_carbs is not None else (db_result["carbs_g"] if db_result else round(grams * 0.15, 1)),
-                "fats_g": float(explicit_fats) if explicit_fats is not None else (db_result["fats_g"] if db_result else round(grams * 0.05, 1)),
+                "calories": float(explicit_cal) if explicit_cal is not None else (db_result["calories"] if db_result else round(grams * 0.7, 1)),
+                "protein_g": float(explicit_pro) if explicit_pro is not None else (db_result["protein_g"] if db_result else round(grams * 0.05, 1)),
+                "carbs_g": float(explicit_carbs) if explicit_carbs is not None else (db_result["carbs_g"] if db_result else round(grams * 0.10, 1)),
+                "fats_g": float(explicit_fats) if explicit_fats is not None else (db_result["fats_g"] if db_result else round(grams * 0.03, 1)),
                 "from_db": False,
                 "explicit": True,
             }
 
-        if not item_result and user_id:
-            # Check Food_Cache (Rule #3 — learned corrections)
-            cached = sheets.lookup_food_cache(user_id, food_name)
-            if cached:
-                c = cached[0]
-                factor = grams / max(float(c.get("grams", 100)), 1)
+        if not item_result:
+            # Fuzzy search: user Food_Cache first, then global Food_Library
+            fuzzy = sheets.find_food_fuzzy(food_name, user_id=user_id)
+            if fuzzy:
+                factor = grams / 100.0
                 item_result = {
                     "item": food_name,
                     "grams": grams,
-                    "calories": round(float(c.get("calories", 0)) * factor, 1),
-                    "protein_g": round(float(c.get("protein_g", 0)) * factor, 1),
-                    "carbs_g": round(float(c.get("carbs_g", 0)) * factor, 1),
-                    "fats_g": round(float(c.get("fats_g", 0)) * factor, 1),
+                    "calories": round(fuzzy["calories_per_100"] * factor, 1),
+                    "protein_g": round(fuzzy["protein_per_100"] * factor, 1),
+                    "carbs_g": round(fuzzy["carbs_per_100"] * factor, 1),
+                    "fats_g": round(fuzzy["fats_per_100"] * factor, 1),
                     "from_db": False,
-                    "from_cache": True,
+                    "from_library": True,
+                    "match_name": fuzzy.get("match_name"),
+                    "match_score": fuzzy.get("match_score"),
+                    "source": fuzzy.get("source"),  # "cache" or "library"
                 }
 
         if not item_result:
-            # Try local nutrition_db
+            # Local nutrition_db (BRANDS dict → FOODS dict)
             db_result = nutrition_db.calculate_nutrition(food_name, grams)
             if db_result:
                 item_result = db_result
             else:
-                # Generic estimate fallback
-                item_result = {
-                    "item": food_name,
-                    "grams": grams,
-                    "calories": round(grams * 1.2, 1),
-                    "protein_g": round(grams * 0.08, 1),
-                    "carbs_g": round(grams * 0.15, 1),
-                    "fats_g": round(grams * 0.05, 1),
-                    "from_db": False,
-                }
+                # Gemini estimation for unknown items
+                gemini_est = gemini_client.estimate_nutrition(food_name, grams)
+                if gemini_est:
+                    item_result = {
+                        "item": food_name,
+                        "grams": grams,
+                        **gemini_est,
+                        "from_db": False,
+                        "estimated": True,
+                    }
+                else:
+                    # Final conservative fallback
+                    item_result = {
+                        "item": food_name,
+                        "grams": grams,
+                        "calories": round(grams * 0.7, 1),
+                        "protein_g": round(grams * 0.05, 1),
+                        "carbs_g": round(grams * 0.10, 1),
+                        "fats_g": round(grams * 0.03, 1),
+                        "from_db": False,
+                        "estimated": True,
+                    }
 
         items.append(item_result)
         total_cal += item_result["calories"]
@@ -438,12 +561,20 @@ def calculate_food_nutrition(extracted_items: list[dict], user_id: int = 0) -> d
         total_carbs += item_result["carbs_g"]
         total_fats += item_result["fats_g"]
 
+    # Flag suspicious estimates: estimated item with >500 kcal or >25g protein
+    suspicious_items = [
+        i for i in items
+        if i.get("estimated")
+        and (i["calories"] > 500 or i["protein_g"] > 25)
+    ]
+
     return {
         "items": items,
         "total_calories": round(total_cal, 1),
         "total_protein": round(total_pro, 1),
         "total_carbs": round(total_carbs, 1),
         "total_fats": round(total_fats, 1),
+        "has_suspicious_estimates": bool(suspicious_items),
     }
 
 
@@ -498,6 +629,8 @@ def calculate_scale_data(
 ) -> dict:
     """Save biometrics and pre-calculate all scale feedback data."""
     sheets.log_biometrics(user_id, weight, fat, water, bone, muscle)
+    # New weight → recalculate daily targets on next call
+    invalidate_daily_targets(user_id)
 
     profile = sheets.get_profile(user_id)
     height = float(profile.get("height_cm", 170)) if profile else 170
@@ -536,30 +669,25 @@ def calculate_daily_status(user_id: int) -> dict:
     if not profile:
         return {}
 
-    # BMR / TDEE from profile + biometrics
-    weight = float(profile.get("initial_weight_kg", 70))
-    bio = data["biometrics"]
-    if bio:
-        weight = float(bio[-1].get("weight_kg", weight))
-    bmr = calculate_bmr(
-        weight,
-        float(profile.get("height_cm", 170)),
-        int(profile.get("age", 30)),
-        str(profile.get("gender", "male")),
-    )
+    # Daily targets (cached, uses activity_level + goal from profile)
+    targets = calculate_daily_targets(user_id)
+    if not targets:
+        return {}
+    bmr = targets["bmr"]
+
+    # Add today's workout calories to TDEE (targets.tdee has no exercise yet)
     exercises = data["exercise"]
     today_ex = [e for e in exercises if e.get("date") == sheets.today()]
     ex_kcal = sum(float(e.get("estimated_kcal", 0)) for e in today_ex)
-    tdee = calculate_tdee(bmr, ex_kcal)
+    tdee = round(targets["tdee"] + ex_kcal, 1)
 
     # Food
     food = [f for f in data["food"] if f.get("date") == sheets.today()]
     total_cal = sum(float(f.get("calories", 0)) for f in food)
     total_pro = sum(float(f.get("protein_g", 0)) for f in food)
-    remaining_cal = round(max(0, tdee - total_cal))
+    remaining_cal = round(max(0, tdee + targets["calories"] - targets["tdee"] - total_cal))
 
-    # Macro target
-    targets = calculate_macro_targets(tdee)
+    # Protein progress vs weight-based target
     protein_pct = round(total_pro / max(targets["protein_g"], 1) * 100)
     protein_status = f"{total_pro:.0f}g / {targets['protein_g']}g ({protein_pct}%)"
 
@@ -598,6 +726,13 @@ def calculate_daily_status(user_id: int) -> dict:
         "date": sheets.today(),
         "bmr": bmr,
         "tdee": tdee,
+        "goal": targets["goal"],
+        "activity_level": targets["activity_level"],
+        "cal_target": targets["calories"],
+        "protein_target": targets["protein_g"],
+        "carbs_target": targets["carbs_g"],
+        "fats_target": targets["fats_g"],
+        "protein_per_kg": targets["protein_per_kg"],
         "total_cal": total_cal,
         "remaining_cal": remaining_cal,
         "protein_status": protein_status,

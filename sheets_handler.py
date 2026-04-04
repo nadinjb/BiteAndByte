@@ -106,7 +106,8 @@ def invalidate_all_caches() -> None:
 def profiles_ws() -> gspread.Worksheet:
     return _get_or_create_worksheet(
         config.WS_PROFILES,
-        ["user_id", "name", "age", "gender", "height_cm", "initial_weight_kg"],
+        ["user_id", "name", "age", "gender", "height_cm", "initial_weight_kg",
+         "activity_level", "goal"],
     )
 
 
@@ -177,6 +178,14 @@ def food_cache_ws() -> gspread.Worksheet:
     )
 
 
+def food_library_ws() -> gspread.Worksheet:
+    """Global shared Food_Library — per-100g values, no user_id."""
+    return _get_or_create_worksheet(
+        config.WS_FOOD_LIBRARY,
+        ["item", "calories", "protein_g", "carbs_g", "fats_g", "date"],
+    )
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -210,14 +219,17 @@ def get_profile(user_id: int) -> dict | None:
 def save_profile(
     user_id: int, name: str, age: int, gender: str,
     height_cm: float, initial_weight_kg: float,
+    activity_level: str = "sedentary",
+    goal: str = "maintain",
 ) -> None:
     ws = profiles_ws()
     records = _retry(ws.get_all_records)
-    row_data = [str(user_id), name, age, gender, height_cm, initial_weight_kg]
+    row_data = [str(user_id), name, age, gender, height_cm, initial_weight_kg,
+                activity_level, goal]
     for idx, r in enumerate(records):
         if str(r.get("user_id")) == str(user_id):
             row_num = idx + 2
-            _retry(ws.update, f"A{row_num}:F{row_num}", [row_data])
+            _retry(ws.update, f"A{row_num}:H{row_num}", [row_data])
             _invalidate_cache(config.WS_PROFILES)
             return
     _retry(ws.append_row, row_data, value_input_option="RAW")
@@ -457,6 +469,131 @@ def lookup_food_cache(user_id: int, search_term: str) -> list[dict]:
         and (term in str(r.get("item", "")).lower()
              or str(r.get("item", "")).lower() in term)
     ][:5]
+
+
+# ---------------------------------------------------------------------------
+# Food_Library — global fuzzy-learning database
+# ---------------------------------------------------------------------------
+
+def find_food_fuzzy(
+    item_name: str, user_id: int = 0, threshold: int = 85,
+) -> dict | None:
+    """Fuzzy-match item_name against Food_Cache (user) and Food_Library (global).
+
+    Returns a normalized per-100g dict or None if no match >= threshold.
+    User-specific Food_Cache entries are checked first and take priority.
+    """
+    from rapidfuzz import process, fuzz  # lazy import — only when called
+
+    query = item_name.strip()
+    if not query:
+        return None
+
+    # 1. User's personal Food_Cache (per-serving values → normalize to per-100g)
+    if user_id:
+        cache_recs = _get_records_cached(food_cache_ws, "Food_Cache")
+        user_recs = [r for r in cache_recs if str(r.get("user_id")) == str(user_id)]
+        if user_recs:
+            names = [str(r.get("item", "")) for r in user_recs]
+            match = process.extractOne(query, names, scorer=fuzz.WRatio)
+            if match and match[1] >= threshold:
+                r = user_recs[match[2]]
+                try:
+                    ref_g = float(r.get("grams") or 100)
+                    factor = 100.0 / max(ref_g, 1)
+                    return {
+                        "calories_per_100": round(float(r.get("calories", 0)) * factor, 1),
+                        "protein_per_100": round(float(r.get("protein_g", 0)) * factor, 1),
+                        "carbs_per_100": round(float(r.get("carbs_g", 0)) * factor, 1),
+                        "fats_per_100": round(float(r.get("fats_g", 0)) * factor, 1),
+                        "match_name": r.get("item"),
+                        "match_score": round(match[1]),
+                        "source": "cache",
+                    }
+                except (ValueError, TypeError):
+                    pass
+
+    # 2. Global Food_Library (already stored per-100g)
+    lib_recs = _get_records_cached(food_library_ws, config.WS_FOOD_LIBRARY)
+    if lib_recs:
+        names = [str(r.get("item", "")) for r in lib_recs]
+        match = process.extractOne(query, names, scorer=fuzz.WRatio)
+        if match and match[1] >= threshold:
+            r = lib_recs[match[2]]
+            try:
+                return {
+                    "calories_per_100": round(float(r.get("calories", 0)), 1),
+                    "protein_per_100": round(float(r.get("protein_g", 0)), 1),
+                    "carbs_per_100": round(float(r.get("carbs_g", 0)), 1),
+                    "fats_per_100": round(float(r.get("fats_g", 0)), 1),
+                    "match_name": r.get("item"),
+                    "match_score": round(match[1]),
+                    "source": "library",
+                }
+            except (ValueError, TypeError):
+                pass
+
+    return None
+
+
+def save_to_library(
+    item: str,
+    calories_per_100: float,
+    protein_per_100: float,
+    carbs_per_100: float,
+    fats_per_100: float,
+) -> None:
+    """Save or update a food item in the global Food_Library (per-100g values).
+
+    Called after /correct so the bot learns the item for all future users.
+    """
+    ws = food_library_ws()
+    records = _retry(ws.get_all_records)
+    term = item.strip().lower()
+    row_data = [
+        item,
+        round(calories_per_100, 1),
+        round(protein_per_100, 1),
+        round(carbs_per_100, 1),
+        round(fats_per_100, 1),
+        today(),
+    ]
+    for idx, r in enumerate(records):
+        if str(r.get("item", "")).lower() == term:
+            row_num = idx + 2
+            _retry(ws.update, f"A{row_num}:F{row_num}", [row_data])
+            _invalidate_cache(config.WS_FOOD_LIBRARY)
+            return
+    _retry(ws.append_row, row_data, value_input_option="RAW")
+    _invalidate_cache(config.WS_FOOD_LIBRARY)
+
+
+def update_last_log(user_id: int, new_values: dict) -> dict | None:
+    """Update multiple nutrition fields in the user's most recent Food_Log row.
+
+    new_values keys: "calories", "protein", "carbs", "fats" (any subset).
+    Returns the updated row dict or None if no entry found.
+    """
+    ws = food_ws()
+    records = _retry(ws.get_all_records)
+    last_idx = None
+    for idx, r in enumerate(records):
+        if str(r.get("user_id")) == str(user_id):
+            last_idx = idx
+    if last_idx is None:
+        return None
+    row_num = last_idx + 2  # +1 header, +1 zero-index
+    for field, value in new_values.items():
+        col = _FOOD_COL.get(field)
+        if col and value is not None:
+            _retry(ws.update_cell, row_num, col, float(value))
+    _invalidate_cache(config.WS_FOOD)
+    # Return updated record
+    record = dict(records[last_idx])
+    for field, value in new_values.items():
+        key = field + ("_g" if field != "calories" else "")
+        record[key] = value
+    return record
 
 
 # ---------------------------------------------------------------------------

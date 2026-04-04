@@ -25,7 +25,11 @@ logger = logging.getLogger(__name__)
 
 _client: genai.Client | None = None
 
-_SYSTEM_HEB = "אתה יועץ תזונה ובריאות מקצועי. ענה תמיד בעברית."
+_SYSTEM_HEB = (
+    "אתה מנהל מסד נתונים תזונתי ויועץ בריאות מקצועי. ענה תמיד בעברית. "
+    "הדאטה שמורה ב-Food_Library היא האמת המוחלטת — תמיד העדף אותה על פני הערכות. "
+    "תיקונים של המשתמש הם עובדות מוחלטות ומחייבות."
+)
 
 
 def _get_client() -> genai.Client:
@@ -148,19 +152,18 @@ def extract_food_from_text(description: str, cached_items: list[dict] | None = N
 {cache_lines}
 """
 
-    prompt = f"""זהה את כל פריטי המזון ואת המשקל המשוער בגרמים מהתיאור הבא.
+    prompt = f"""אתה מנהל מסד נתונים תזונתי. זהה את פריטי המזון מהתיאור הבא.
 
 כללים קריטיים:
-1. עדיפות לנתונים מפורשים: אם המשתמש ציין מספר ספציפי (למשל "25g חלבון", "300 קלוריות", "15g שומן"), חלץ את המספר המדויק. אל תעריך — השתמש במה שנכתב.
-2. מודעות למותגים: אם מוזכר שם מותג (Muller, PRO, Go, דנונה, יוטבתה), העדף את הגרסה עתירת החלבון / High Protein של המוצר.
-3. אם לא צוין משקל, הערך מנה ממוצעת בגרמים.
+1. עדיפות לנתונים מפורשים: אם המשתמש ציין מספר ספציפי (למשל "25g חלבון", "300 קלוריות"), חלץ אותו במדויק. אל תעריך.
+2. מודעות למותגים: אם מוזכר שם מותג (Muller, PRO, Go, דנונה, יוטבתה, Alpro), ציין את שם המותג המלא.
+3. אם לא צוין משקל — הערך מנה ממוצעת בגרמים.
+4. אל תמציא ערכי תזונה — השאר null לכל מה שלא צוין מפורשות.
 {cache_ctx}
 תיאור: "{description}"
 
 החזר JSON בלבד (בלי markdown):
 [{{"item": "שם הפריט", "grams": 0, "calories": null, "protein_g": null, "carbs_g": null, "fats_g": null}}, ...]
-
-מלא ערכי תזונה רק אם המשתמש ציין אותם במפורש. השאר null למה שלא צוין.
 
 דוגמאות:
 - "מולר 25g חלבון" → {{"item": "מולר פרו", "grams": 200, "protein_g": 25}}
@@ -202,6 +205,122 @@ def extract_food_from_photo(image_bytes: bytes) -> list[dict]:
     if "item" in result:
         return [result]
     return [{"item": "ארוחה לא מזוהה", "grams": 200}]
+
+
+def classify_intent(text: str) -> dict:
+    """Classify the user's intent from natural Hebrew text.
+
+    Returns:
+    {
+        "intent": "log_food|log_workout|log_water|log_scale|log_cycle|log_sleep|correct_food|answer_question|status|review",
+        "data": {...},           # extracted fields
+        "missing_fields": [...], # required fields not found
+        "follow_up": "..."       # natural Hebrew question if fields missing, else null
+    }
+    """
+    prompt = f"""אתה מסווג כוונות של משתמש בוט בריאות עברי. קרא את ההודעה וזהה את הכוונה.
+
+כוונות אפשריות:
+• log_food — אכילה/שתיית משקה עם קלוריות (לא מים)
+• log_workout — אימון ספורט
+• log_water — שתיית מים בלבד
+• log_scale — שקילה / מדידת הרכב גוף
+• log_cycle — שלב מחזור וסת
+• log_sleep — שינה ו/או צעדים
+• correct_food — תיקון רישום ("תתקן", "זה לא", "שגוי", "הייתה", "עדכן")
+• status — בקשת סטטוס/סיכום יומי
+• review — בקשת סיכום שבועי
+• answer_question — שאלה / שיחה / כל דבר אחר
+
+---
+סכמת ה-data לפי כוונה (null לשדות חסרים):
+
+log_food: {{"description": "<תיאור מלא של הארוחה>"}}
+
+log_workout: {{"type": "functional|strength|cardio", "duration_min": <int|null>, "intensity": <int 1-10|null>}}
+  מיפוי: כוח/משקולות→strength | ריצה/אופניים/קרדיו→cardio | פונקציונלי/HIIT/crossfit→functional
+  עצימות: "מאוד קשה/מקסימום"→9 | "קשה/חזק"→8 | "בינוני"→6 | "קל"→4
+
+log_water: {{"liters": <float>}}
+  המרות: כוס=0.25 | כוסית=0.1 | בקבוק=0.5 | ליטר=1.0
+
+log_scale: {{"weight_kg": <float>, "body_fat_pct": <float|null>, "water_pct": <float|null>, "bone_mass_kg": <float|null>, "muscle_mass_kg": <float|null>}}
+
+log_cycle: {{"phase": "follicular|ovulation|luteal|menstrual", "notes": "<str|null>"}}
+  מיפוי: זקיק→follicular | ביוץ→ovulation | לוטאלי→luteal | מחזור/דימום→menstrual
+
+log_sleep: {{"steps": <int|null>, "sleep_hours": <float|null>, "sleep_quality": "good|fair|poor|null"}}
+  מיפוי: טוב/נהדר→good | בסדר/רגיל→fair | גרוע/נורא/לא טוב→poor
+
+correct_food: {{"item": "<שם פריט|'האחרון'>", "grams": <float|null>, "calories": <float|null>, "protein_g": <float|null>, "carbs_g": <float|null>, "fats_g": <float|null>}}
+
+status, review, answer_question: {{}}
+
+---
+חוקים:
+1. missing_fields — רשימת שמות שדות חובה שחסרים
+2. follow_up — שאלת המשך טבעית בעברית אם missing_fields אינה ריקה, אחרת null
+3. אל תמציא ערכים — אם לא צוין, רשום null
+
+דוגמאות:
+"עשיתי אימון כוח 45 דקות עצימות 8" → {{"intent":"log_workout","data":{{"type":"strength","duration_min":45,"intensity":8}},"missing_fields":[],"follow_up":null}}
+"היה לי ריצה קלה" → {{"intent":"log_workout","data":{{"type":"cardio","duration_min":null,"intensity":4}},"missing_fields":["duration_min"],"follow_up":"כמה זמן רצת?"}}
+"אכלתי יוגורט מולר 165 גרם" → {{"intent":"log_food","data":{{"description":"יוגורט מולר 165 גרם"}},"missing_fields":[],"follow_up":null}}
+"שתיתי 2 כוסות מים" → {{"intent":"log_water","data":{{"liters":0.5}},"missing_fields":[],"follow_up":null}}
+"תתקן חלב שקדים ל-39 קלוריות ל-300 מ\"ל" → {{"intent":"correct_food","data":{{"item":"חלב שקדים","grams":300,"calories":39}},"missing_fields":[],"follow_up":null}}
+"שקלתי 74.3" → {{"intent":"log_scale","data":{{"weight_kg":74.3}},"missing_fields":[],"follow_up":null}}
+"ישנתי 7 שעות שינה טובה" → {{"intent":"log_sleep","data":{{"sleep_hours":7,"sleep_quality":"good","steps":null}},"missing_fields":[],"follow_up":null}}
+"מה אני אמורה לאכול?" → {{"intent":"answer_question","data":{{}},"missing_fields":[],"follow_up":null}}
+
+הודעה: "{text}"
+
+החזר JSON בלבד (בלי markdown):"""
+
+    raw = _ask_flash(prompt)
+    result = _parse_json(raw, fallback={})
+
+    # Ensure all keys exist with safe defaults
+    result.setdefault("intent", "answer_question")
+    result.setdefault("data", {})
+    result.setdefault("missing_fields", [])
+    result.setdefault("follow_up", None)
+
+    # Sanitize missing_fields — must be a list
+    if not isinstance(result["missing_fields"], list):
+        result["missing_fields"] = []
+
+    return result
+
+
+def estimate_nutrition(food_name: str, grams: float) -> dict | None:
+    """Ask Gemini to estimate nutrition for an item not found in any local DB.
+
+    Returns dict with calories, protein_g, carbs_g, fats_g for the given grams,
+    or None if Gemini fails. Values are conservative (lower-bound).
+    """
+    prompt = f"""אתה מנהל מסד נתונים תזונתי. הפריט הבא אינו ברשימתי — הערך ערכים תזונתיים שמרניים (גבול תחתון).
+
+פריט: {food_name}
+כמות: {grams:.0f} גרם
+
+החזר JSON בלבד (בלי markdown):
+{{"calories": 0, "protein_g": 0, "carbs_g": 0, "fats_g": 0}}
+
+חשוב: הערכים הם עבור {grams:.0f} גרם בדיוק. השתמש בהערכה שמרנית. מספרים בלבד."""
+
+    text = _ask_flash(prompt)
+    result = _parse_json(text, fallback={})
+    if not result or "calories" not in result:
+        return None
+    try:
+        return {
+            "calories": round(float(result.get("calories", 0)), 1),
+            "protein_g": round(float(result.get("protein_g", 0)), 1),
+            "carbs_g": round(float(result.get("carbs_g", 0)), 1),
+            "fats_g": round(float(result.get("fats_g", 0)), 1),
+        }
+    except (ValueError, TypeError):
+        return None
 
 
 def extract_blood_markers(image_bytes: bytes) -> dict:
