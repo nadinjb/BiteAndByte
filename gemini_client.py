@@ -10,12 +10,13 @@ import io
 import json
 import logging
 import re
+import time
 
 from google import genai
 from google.genai import types
 from google.genai.errors import APIError
 from PIL import Image
-from tenacity import retry, retry_if_exception, stop_after_attempt, wait_base
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_fixed
 
 import config
 
@@ -75,17 +76,28 @@ def _retry_after(exc: BaseException) -> float:
     return float(m.group(1)) + 1.0 if m else _DEFAULT_BACKOFF
 
 
-class _WaitFromError(wait_base):
-    """Tenacity wait strategy that reads the delay from the exception message."""
-    def __call__(self, retry_state) -> float:
-        exc = retry_state.outcome.exception()
-        return _retry_after(exc) if exc else _DEFAULT_BACKOFF
+def _before_sleep(retry_state) -> None:
+    """Sleep for the server-requested duration before each tenacity retry.
+
+    Parses 'Please retry in X.Xs' from the exception message.
+    Defaults to _DEFAULT_BACKOFF (45s) when the hint is absent.
+    tenacity's own wait is set to wait_fixed(0), so this is the only sleep.
+    """
+    exc = retry_state.outcome.exception()
+    delay = _retry_after(exc) if exc else _DEFAULT_BACKOFF
+    logger.warning(
+        "Gemini 429 — waiting %.0fs before retry %d/3",
+        delay,
+        retry_state.attempt_number,
+    )
+    time.sleep(delay)
 
 
 @retry(
     retry=retry_if_exception(_is_rate_limit),
     stop=stop_after_attempt(3),
-    wait=_WaitFromError(),
+    wait=wait_fixed(0),        # actual sleep happens in before_sleep above
+    before_sleep=_before_sleep,
     reraise=True,
 )
 def _generate(client: genai.Client, model: str, contents, cfg) -> str:
