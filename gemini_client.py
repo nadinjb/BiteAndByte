@@ -9,11 +9,17 @@ STRICT ROLE SEPARATION:
 import io
 import json
 import logging
-import time
 
 from google import genai
 from google.genai import types
+from google.genai.errors import APIError
 from PIL import Image
+from tenacity import (
+    retry,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 import config
 
@@ -28,8 +34,13 @@ _client: genai.Client | None = None
 _SYSTEM_HEB = (
     "אתה מנהל מסד נתונים תזונתי ויועץ בריאות מקצועי. ענה תמיד בעברית. "
     "הדאטה שמורה ב-Food_Library היא האמת המוחלטת — תמיד העדף אותה על פני הערכות. "
-    "תיקונים של המשתמש הם עובדות מוחלטות ומחייבות."
+    "תיקונים של המשתמש הם עובדות מוחלטות ומחייבות. "
+    "אם נדרשים מספר קריאות לפונקציות, בצע את כולן במקביל בתגובה אחת — אל תשלח קריאה אחת ותחכה לתשובה לפני השנייה."
 )
+
+# AFC config applied to every generate_content call so the SDK never loops.
+# We do not define any tools, so maximum_remote_calls=2 is a safety ceiling only.
+_AFC_CFG = types.AutomaticFunctionCallingConfig(maximum_remote_calls=2)
 
 
 def _get_client() -> genai.Client:
@@ -47,30 +58,39 @@ def _load_image(image_bytes: bytes) -> Image.Image:
     return Image.open(io.BytesIO(image_bytes))
 
 
+def _is_rate_limit(exc: BaseException) -> bool:
+    """Return True for 429 errors from the Gemini API."""
+    if isinstance(exc, APIError) and exc.code == 429:
+        return True
+    return "429" in str(exc)
+
+
+@retry(
+    retry=retry_if_exception(_is_rate_limit),
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=6, max=20),
+    reraise=True,
+)
+def _generate(client: genai.Client, model: str, contents, cfg) -> str:
+    """Single Gemini generate_content call wrapped for tenacity retry."""
+    resp = client.models.generate_content(model=model, contents=contents, config=cfg)
+    return resp.text
+
+
 def _call_with_retry(
-    model: str, contents, system: str | None = None, max_retries: int = 3,
+    model: str, contents, system: str | None = None,
 ) -> str:
-    """Call Gemini with retry + backoff for 429 rate-limit errors."""
+    """Call Gemini with AFC depth-limited and exponential backoff on 429."""
     client = _get_client()
-    cfg = None
-    if system:
-        cfg = types.GenerateContentConfig(system_instruction=system)
-    for attempt in range(max_retries):
-        try:
-            resp = client.models.generate_content(
-                model=model, contents=contents, config=cfg,
-            )
-            return resp.text
-        except Exception as e:
-            err_str = str(e)
-            if "429" in err_str and attempt < max_retries - 1:
-                wait = (attempt + 1) * 6
-                logger.warning("%s rate-limited (429), retrying in %ds...", model, wait)
-                time.sleep(wait)
-                continue
-            logger.error("%s error: %s", model, e)
-            return ""
-    return ""
+    cfg = types.GenerateContentConfig(
+        system_instruction=system or "",
+        automatic_function_calling=_AFC_CFG,
+    )
+    try:
+        return _generate(client, model, contents, cfg)
+    except Exception as e:
+        logger.error("%s error after retries: %s", model, e)
+        return ""
 
 
 def _ask_flash(prompt: str, image: Image.Image | None = None) -> str:

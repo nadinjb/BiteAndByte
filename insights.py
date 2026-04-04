@@ -67,7 +67,17 @@ def calculate_tdee(
     Logged workouts are added on top so the daily calorie budget reflects
     actual training done (avoids under-eating on heavy training days).
     """
-    factor = config.ACTIVITY_FACTORS.get(activity_level.lower(), 1.2)
+    try:
+        if isinstance(activity_level, (int, float)):
+            factor = float(activity_level)
+            # If it looks like a PAL multiplier (1.0–2.5), use it directly;
+            # if it somehow got stored as a raw int key, fall back to default.
+            if not (1.0 <= factor <= 2.5):
+                factor = 1.2
+        else:
+            factor = config.ACTIVITY_FACTORS.get(str(activity_level).lower().strip(), 1.2)
+    except Exception:
+        factor = 1.2
     return round(bmr * factor + exercise_kcal_today, 1)
 
 

@@ -3,6 +3,7 @@
 Used by the Python math layer so Gemini never does calorie calculations.
 Gemini extracts the food item + grams, Python multiplies from this table.
 """
+from rapidfuzz import process, fuzz as _fuzz
 
 # Format: "food_key": (calories, protein_g, carbs_g, fats_g)  per 100g
 FOODS: dict[str, tuple[float, float, float, float]] = {
@@ -259,15 +260,35 @@ BRANDS: dict[str, tuple[float, float, float, float]] = {
     "gold standard whey": (390, 77.0, 9.0, 5.0),
     "on whey": (390, 77.0, 9.0, 5.0),
     "optimum nutrition": (390, 77.0, 9.0, 5.0),
+
+    # Hebrew transliterations — cross-script fuzzy won't work, so aliases are explicit
+    "דאבל ריץ": (390, 77.0, 9.0, 5.0),
+    "דאבל ריץ שוקולד": (390, 77.0, 9.0, 5.0),
+    "דאבל ריץ' שוקולט": (390, 77.0, 9.0, 5.0),
+    "גולד סטנדרד": (390, 77.0, 9.0, 5.0),
+    "גולד סטנדרט": (390, 77.0, 9.0, 5.0),
+    "אופטימום ניוטרישן": (390, 77.0, 9.0, 5.0),
+    "ON חלבון": (390, 77.0, 9.0, 5.0),
+    "אלפרו": (13, 0.4, 0.5, 1.1),
+    "אלפרו שקדים": (13, 0.4, 0.5, 1.1),
+    "אלפרו שיבולת שועל": (46, 1.0, 6.6, 1.5),
+    "אלפרו סויה": (33, 3.3, 0.5, 1.8),
 }
 
 
 def lookup(food_key: str) -> tuple[float, float, float, float] | None:
     """Look up per-100g nutrition values: (cal, protein, carbs, fats).
 
-    Priority: BRANDS exact → BRANDS substring → FOODS exact → FOODS substring.
-    Substring matches require the db key to be at least 4 chars to avoid
-    spurious matches like "milk" inside "almond milk".
+    Priority:
+      1. BRANDS exact match
+      2. BRANDS substring match (key ≥ 4 chars)
+      3. FOODS exact match
+      4. FOODS substring match (key ≥ 4 chars, prefers longest/most-specific)
+      5. rapidfuzz fuzzy match across BRANDS + FOODS (same script, threshold 75)
+
+    Step 5 catches typos and partial same-language matches.
+    Cross-script matches (Hebrew input vs English DB key) rely on the explicit
+    Hebrew aliases in BRANDS — rapidfuzz edit-distance cannot cross character sets.
     """
     key = food_key.strip().lower()
 
@@ -292,12 +313,26 @@ def lookup(food_key: str) -> tuple[float, float, float, float] | None:
         if len(db_key) < 4:
             continue
         if db_key in key or key in db_key:
-            # Prefer longer (more specific) match
             if len(db_key) > best_len:
                 best_match = values
                 best_len = len(db_key)
 
-    return best_match
+    if best_match:
+        return best_match
+
+    # 5. Fuzzy match — handles typos and partial names within the same script.
+    #    Merge BRANDS + FOODS; BRANDS keys take priority on equal scores.
+    combined: dict[str, tuple[float, float, float, float]] = {**FOODS, **BRANDS}
+    result = process.extractOne(
+        key,
+        combined.keys(),
+        scorer=_fuzz.WRatio,
+        score_cutoff=75,
+    )
+    if result:
+        return combined[result[0]]
+
+    return None
 
 
 def calculate_nutrition(food_key: str, grams: float) -> dict:
